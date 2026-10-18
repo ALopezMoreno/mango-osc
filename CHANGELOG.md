@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for vacuum mass eigenstates entering the profile, as solar neutrinos reach the
   Earth at night. It agrees with independent matrix exponentials to 1e-12 and
   reduces to `|U_{beta i}|^2` in vacuum (`tests/test_mass_states.py`).
+- **Solar predictions from the whole production region.** `solar.load_production`
+  bundles production distributions for pp, pep, hep, 7Be, 8B, 13N, 15O and 17F,
+  with electron and neutron densities, for the SF-III/GS98 and BS05(OP) standard
+  solar models. `solar.production_mixing` averages the adiabatic composition over
+  a source's production region, by an exact sum over radii or, for three flavors
+  with the charged-current potential only, a fast correlation in ln(2 E V_CC)
+  (agreeing to 1e-8). `solar.solar_probabilities` gives P(nu_e -> nu_beta) by day
+  and at night through Earth segments, using `mass_probability_profile`.
+- **Neutron density on solar profiles.** `SolarProfile` carries `rho_yn`
+  (from `load_bs05`), and `adiabatic_mass_fractions` gives sterile flavors their
+  neutral-current term with it (`tests/test_solar_production.py`).
 
 ## [0.2.4] - 2026-08-04
 

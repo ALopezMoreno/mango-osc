@@ -36,5 +36,8 @@ Issues = "https://github.com/pgranger23/mango-osc/issues"
 [tool.setuptools.packages.find]
 include = ["mango*"]
 
+[tool.setuptools.package-data]
+mango = ["data/solar/*.dat"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

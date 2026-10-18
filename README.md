@@ -175,6 +175,13 @@ mango.mass_probability_profile(params, E, density_gcc=[...], ye=[...], length_km
 # solar adiabatic MSW: vacuum mass-state fractions vs radius
 prof = mango.solar.load_bs05("examples/data/bs05_agsop.dat")
 F = mango.solar.adiabatic_mass_fractions(params, E_GeV, prof, r_km, r_emit_km)
+
+# solar neutrinos from a source's whole production region (bundled SF3_GS98 / BS05_OP models):
+# P(nu_e -> nu_beta) by day, and at night through Earth segments (one chord or a batch)
+prod = mango.solar.load_production("SF3_GS98")
+P_day = mango.solar.solar_probabilities(params, E_GeV, prod, source="8B")
+P_night = mango.solar.solar_probabilities(params, E_GeV, prod, source="8B",
+                                          density_gcc=[...], ye=[...], length_km=[...])
 ```
 
 ### NSI and sterile neutrinos
