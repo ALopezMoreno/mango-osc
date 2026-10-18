@@ -167,6 +167,11 @@ mango.probability_earth(params, E, cz,
 # arbitrary piecewise-constant profile (source -> detector ordering)
 mango.probability_profile(params, E, density_gcc=[...], ye=[...], length_km=[...])
 
+# its evolution operator S[beta, alpha], and P(nu_i -> nu_beta) for mass eigenstates entering
+# it (solar neutrinos at night); 2-D segment arrays (n_paths, n_seg) give a batch of paths
+mango.amplitude_profile(params, E, density_gcc=[...], ye=[...], length_km=[...])
+mango.mass_probability_profile(params, E, density_gcc=[...], ye=[...], length_km=[...])
+
 # solar adiabatic MSW: vacuum mass-state fractions vs radius
 prof = mango.solar.load_bs05("examples/data/bs05_agsop.dat")
 F = mango.solar.adiabatic_mass_fractions(params, E_GeV, prof, r_km, r_emit_km)

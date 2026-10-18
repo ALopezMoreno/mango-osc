@@ -269,6 +269,69 @@ def probability_profile(params, energy_GeV, density_gcc, ye, length_km,
     return p
 
 
+def amplitude_profile(params, energy_GeV, density_gcc, ye, length_km,
+                      anti=False, backend="cayley", nsi=None):
+    """Evolution operator ``S`` through a piecewise-constant profile, or a batch of them.
+
+    ``density_gcc``, ``ye`` and ``length_km`` hold one entry per segment, ordered
+    source -> detector: 1-D for one path, or 2-D ``(n_paths, n_seg)`` for a batch
+    of paths.  Zero-length segments are identities, so shorter paths can be padded
+    with them.  ``energy_GeV`` is a scalar or 1-D array.  Returns
+    ``S[..., beta, alpha] = <nu_beta|S|nu_alpha>`` with shape
+    ``([n_paths,] [n_E,] N, N)``; :func:`probability_profile` is ``|S|^2``.
+    """
+    _check_positive(energy_GeV, "energy_GeV", "GeV, not eV")
+    _check_nonneg(density_gcc, "density_gcc", "g/cm^3")
+    _check_nonneg(length_km, "length_km", "km, not m")
+
+    density_gcc = jnp.asarray(density_gcc)
+    if density_gcc.ndim not in (1, 2):
+        raise ValueError("density_gcc must be 1-D (one path) or 2-D (n_paths, n_seg), "
+                         f"got shape {density_gcc.shape}")
+    ye = jnp.broadcast_to(jnp.asarray(ye), density_gcc.shape)
+    length_invEV = jnp.broadcast_to(jnp.asarray(length_km), density_gcc.shape) * C.KM_TO_INV_EV
+    v_cc, v_nc = C.matter_potentials(density_gcc, ye)
+    u, msq = params.pmns(), params.msquared()
+    na = _n_active(params)
+    nsi_mat = _nsi_matrix(nsi, na)
+    backend = _resolve_backend(params, backend)
+    energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
+
+    def path(v, vn, l):
+        def core(e_eV):
+            return propagate_layers(u, msq, e_eV, v, l, anti=anti, backend=backend,
+                                    nsi=nsi_mat, v_nc=vn, n_active=na)
+        return core(energy_eV) if energy_eV.ndim == 0 else jax.vmap(core)(energy_eV)
+
+    if density_gcc.ndim == 1:
+        return path(v_cc, v_nc, length_invEV)
+    return jax.vmap(path)(v_cc, v_nc, length_invEV)
+
+
+def mass_probability_profile(params, energy_GeV, density_gcc, ye, length_km,
+                             anti=False, backend="cayley", nsi=None,
+                             mass_in=None, flavor_out=None):
+    """Probabilities ``P(nu_i -> nu_beta)`` for vacuum mass eigenstates entering a profile.
+
+    Neutrinos that reach the profile as an incoherent mixture of mass eigenstates
+    (solar neutrinos at night, supernova neutrinos) need these instead of
+    flavor-to-flavor probabilities: ``P[..., beta, i] = |(S U)_{beta i}|^2``, with
+    ``U`` the mixing matrix (``U*`` for antineutrinos) and ``S`` from
+    :func:`amplitude_profile`, which takes the same arguments.  In vacuum this is
+    ``|U_{beta i}|^2``.  Returns ``([n_paths,] [n_E,] N, N)``, or the single entry
+    if both ``mass_in`` and ``flavor_out`` are given.
+    """
+    _check_flavor_index(mass_in, n_flavors(params), "mass_in")
+    _check_flavor_index(flavor_out, n_flavors(params), "flavor_out")
+    s = amplitude_profile(params, energy_GeV, density_gcc, ye, length_km,
+                          anti=anti, backend=backend, nsi=nsi)
+    u = params.pmns()
+    p = jnp.abs(s @ (jnp.conj(u) if anti else u)) ** 2
+    if mass_in is not None and flavor_out is not None:
+        return select(p, mass_in, flavor_out)
+    return p
+
+
 def _grid_eval(core, energy_eV, cz):
     """Evaluate ``core(E, cz)`` over scalar/1-D combinations.
 

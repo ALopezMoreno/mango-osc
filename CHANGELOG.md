@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`amplitude_profile`** returns the evolution operator through a
+  piecewise-constant profile, and accepts 2-D segment arrays `(n_paths, n_seg)`
+  for a batch of paths, padded with zero-length segments.
+- **`mass_probability_profile`** returns `P(nu_i -> nu_beta) = |(S U)_{beta i}|^2`
+  for vacuum mass eigenstates entering the profile, as solar neutrinos reach the
+  Earth at night. It agrees with independent matrix exponentials to 1e-12 and
+  reduces to `|U_{beta i}|^2` in vacuum (`tests/test_mass_states.py`).
+
 ## [0.2.4] - 2026-08-04
 
 ### Fixed

@@ -39,6 +39,8 @@ from .oscillator import (  # noqa: E402
     probability_vacuum,
     probability_profile,
     probability_earth,
+    amplitude_profile,
+    mass_probability_profile,
     select,
 )
 
@@ -50,6 +52,8 @@ __all__ = [
     "probability_constant",
     "probability_vacuum",
     "probability_profile",
+    "amplitude_profile",
+    "mass_probability_profile",
     "probability_earth",
     "select",
     "NSI",
