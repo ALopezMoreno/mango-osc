@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `rho_yn = rho (1 - Y_e)`, filled by `load_bs05`.
 - **`solar.adiabaticity`**: the smallest adiabaticity parameter on the way out
   of the Sun; `production_mixing` warns below 10.
+- **`outer="exact"`** in `production_mixing` and `probability_solar`: Parke's
+  factorisation (PRL 57, 1275 (1986)), adiabatic in the production region and
+  exact layered propagation outside it, for resonances outside the production
+  region (e.g. small active-sterile mixing).
 
 ### Changed
 

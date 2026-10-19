@@ -171,7 +171,7 @@ def _smooth_profile(n=20001):
     return solar.SolarProfile(r, ne, solar.R_SUN_KM, 0.4 * ne), (lambda x: 245.0 * np.exp(-10.54 * x))
 
 
-def _exact_fractions(params, energy_GeV, density, r0, n_layers=40000, neutrons=0.0):
+def _exact_fractions(params, energy_GeV, density, r0, n_layers=40000, neutrons=0.4, anti=False):
     """|(U^dag S)_{i e}|^2 for nu_e propagated through thin layers from r0 [R_sun] to the surface."""
     from mango.layers import propagate_layers
     edges = np.linspace(r0, 1.0, n_layers + 1)
@@ -179,9 +179,10 @@ def _exact_fractions(params, energy_GeV, density, r0, n_layers=40000, neutrons=0
     u, msq = params.pmns(), params.msquared()
     s = propagate_layers(u, msq, energy_GeV * C.GEV_TO_EV, C.matter_potential_eV(jnp.asarray(ne), 1.0),
                          jnp.asarray(np.diff(edges) * solar.R_SUN_KM * C.KM_TO_INV_EV),
-                         v_nc=0.5 * C.matter_potential_eV(jnp.asarray(neutrons * ne), 1.0),
+                         v_nc=0.5 * C.matter_potential_eV(jnp.asarray(neutrons * ne), 1.0), anti=anti,
                          n_active=getattr(params, "n_active", 3), backend="eigh")
-    return np.abs(np.conj(np.asarray(u)).T @ np.asarray(s)[:, 0]) ** 2
+    u_in = np.conj(np.asarray(u)) if anti else np.asarray(u)
+    return np.abs(np.conj(u_in).T @ np.asarray(s)[:, 0]) ** 2
 
 
 def _at(profile, r0):
@@ -265,3 +266,38 @@ def test_probability_solar_options():
     mu = np.asarray(probability_solar(p, ENERGY, PROFILE, WEIGHTS, alpha=1))
     c = np.asarray(solar.production_mixing(p, ENERGY, PROFILE, WEIGHTS, alpha=1))
     assert np.max(np.abs(mu - c @ np.abs(np.asarray(p.pmns())).T ** 2)) < 1e-12
+
+
+def _exact_region(params, energy, density, radii, weights, anti=False):
+    """Exact fractions averaged incoherently over production radii."""
+    out = [w * _exact_fractions(params, energy, density, r, n_layers=20000, anti=anti) for r, w in zip(radii, weights)]
+    return np.sum(out, axis=0) / np.sum(weights)
+
+
+def test_outer_exact_steriles():
+    """Parke factorisation: a resonance outside the production region, gamma ~ 0.4, from 0.47 to < 1e-3."""
+    profile, density = _smooth_profile()
+    r = np.asarray(profile.r_over_rsun)
+    radii = np.linspace(0.0, 0.1, 21)
+    shape = np.exp(-0.5 * ((radii - 0.045) / 0.015) ** 2)
+    weights = np.interp(r, radii, shape) * (r <= 0.1)
+    p = _sterile4(0.01, 1e-4)
+    exact = _exact_region(p, 0.01, density, radii, shape)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got = np.asarray(solar.production_mixing(p, 0.01, profile, weights, outer="exact"))
+    assert np.max(np.abs(got - exact)) < 1e-3
+    three, e = nufit_no(), np.array([0.006, 0.01])
+    exact3 = np.asarray(solar.production_mixing(three, e, profile, weights, outer="exact"))
+    assert np.max(np.abs(exact3 - np.asarray(solar.production_mixing(three, e, profile, weights)))) < 1e-4
+    conv3 = solar.production_mixing(three, e, profile, weights, outer="exact", method="convolution")
+    assert np.max(np.abs(np.asarray(conv3) - exact3)) < 1e-7
+
+
+def test_outer_exact_warns_inside_production_region():
+    """For antineutrinos the sterile resonance lies inside the production region: outer='exact' still warns."""
+    profile, _ = _smooth_profile()
+    r = np.asarray(profile.r_over_rsun)
+    weights = np.exp(-0.5 * ((r - 0.045) / 0.015) ** 2) * (r <= 0.1)
+    with pytest.warns(UserWarning, match="inside the production region"):
+        solar.production_mixing(_sterile4(0.01, 1e-4), 0.01, profile, weights, anti=True, outer="exact")
