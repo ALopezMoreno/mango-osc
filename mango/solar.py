@@ -17,6 +17,8 @@ because the matter eigenstates rotate as the density drops:
 
 from __future__ import annotations
 
+import functools
+import warnings
 from collections import namedtuple
 
 import numpy as np
@@ -25,7 +27,7 @@ import jax.numpy as jnp
 
 from . import constants as C
 from .hamiltonian import matter_hamiltonian
-from .oscillator import _check_flavor_index, _n_active, _nsi_matrix, n_flavors, probability_earth
+from .oscillator import _check_flavor_index, _is_concrete, _n_active, _nsi_matrix, n_flavors, probability_earth
 
 R_SUN_KM = 695700.0
 
@@ -139,32 +141,87 @@ def adiabatic_mass_fractions(params, energy_GeV, profile, r_km,
 
 _WEIGHT_FLOOR = 1e-14   # production weight, relative to the peak, below which radii are dropped
 _DU = 5e-4              # ln(A) grid spacing of the convolution; interpolation error ~ _DU^2
+GAMMA_WARN = 10.0       # production_mixing warns below this adiabaticity
+_GAMMA_ENERGIES = 8     # energies at which production_mixing checks adiabaticity
+
+
+def _check_weights(weights, profile):
+    """Raise on production weights that cannot describe a production region (concrete input only)."""
+    if not _is_concrete(weights):
+        return
+    w = np.asarray(weights, dtype=float)
+    if w.shape != np.shape(profile.r_over_rsun):
+        raise ValueError(f"weights must have one entry per profile radius: shape {np.shape(profile.r_over_rsun)}, "
+                         f"got {w.shape}")
+    if np.any(w < 0) or not np.all(np.isfinite(w)):
+        raise ValueError("weights must be finite and non-negative")
+    if not w.sum() > 0:
+        raise ValueError("weights must not all be zero")
+
+
+def _hamiltonians(params, energy_eV, v_cc, v_nc, anti, nsi):
+    u, msq = params.pmns(), params.msquared()
+    na = _n_active(params)
+    return jax.vmap(lambda v, vn: matter_hamiltonian(u, msq, energy_eV, v, anti=anti, nsi=nsi, v_nc_eV=vn,
+                                                     n_active=na))(v_cc, v_nc)
+
+
+def adiabaticity(params, energy_GeV, profile, r_min=0.0, anti=False, nsi=None):
+    """Smallest adiabaticity parameter on the way out of the Sun from ``r_min`` [R_sun], shape ``([n_E])``.
+
+    ``gamma_ij = (lambda_i - lambda_j)^2 / (2 |<i|dH/dx|j>|)``, minimised over radii
+    and pairs of matter eigenstates; at a two-flavor resonance this is the usual
+    ``Delta m^2 sin^2(2 theta) / (2 E cos(2 theta) |d ln n_e / dx|)``. The adiabatic
+    approximation is good to ~1e-5 above gamma ~ 10 and fails at gamma ~ 1-3.
+    """
+    r = np.asarray(profile.r_over_rsun, dtype=float)
+    sel = np.flatnonzero(r >= r_min)
+    x = jnp.asarray(r[sel] * profile.R_sun_km * C.KM_TO_INV_EV)
+    v_cc, v_nc = _potentials_eV(profile, jnp.asarray(r[sel]))
+    energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
+    return _gamma_min(params, jnp.atleast_1d(energy_eV), x, v_cc, v_nc, _nsi_matrix(nsi, _n_active(params)),
+                      anti).reshape(energy_eV.shape)
+
+
+@functools.partial(jax.jit, static_argnames="anti")
+def _gamma_min(params, energy_eV, x, v_cc, v_nc, nsi, anti):
+    """Minimum over radii and pairs of matter eigenstates of the adiabaticity parameter, per energy."""
+    iu = np.triu_indices(params.msquared().shape[0], 1)
+
+    def at_energy(e_eV):
+        h = _hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi)
+        lam, vec = jnp.linalg.eigh(0.5 * (h[1:] + h[:-1]))
+        dh = (h[1:] - h[:-1]) / jnp.diff(x)[:, None, None]
+        coupling = jnp.abs(jnp.einsum("rai,rab,rbj->rij", jnp.conj(vec), dh, vec))[:, iu[0], iu[1]]
+        gap2 = ((lam[:, :, None] - lam[:, None, :]) ** 2)[:, iu[0], iu[1]]
+        return jnp.min(jnp.where(coupling > 0, gap2 / (2.0 * jnp.where(coupling > 0, coupling, 1.0)), jnp.inf))
+
+    return jax.vmap(at_energy)(energy_eV)
 
 
 def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False, nsi=None, method="sum"):
     """Adiabatic vacuum mass-state fractions of solar neutrinos, averaged over a production region.
 
-    ``weights`` are one source's production weights on ``profile.r_over_rsun``
-    (any normalisation). Returns ``c[..., i]`` with shape ``([n_E,] N)``: the
-    fraction of neutrinos produced as flavor ``alpha`` that leave the Sun as vacuum
-    mass eigenstate ``i``. Matter eigenstates are followed out of the Sun without
-    level crossings, so the k-th lowest at production leaves as the k-th lightest
-    mass state; some sterile or NSI textures cross levels and break this. By day
-    ``P(nu_alpha -> nu_beta) = sum_i c_i |U_{beta i}|^2``; at night use
-    ``probability_earth(..., mass_states=True)`` in place of ``|U|^2``.
+    ``weights`` are production fractions per point of ``profile.r_over_rsun`` (already
+    integrated over each grid shell, not a density dPhi/dr). Returns ``c[..., i]``,
+    shape ``([n_E,] N)``: the fraction produced as ``alpha`` that leaves the Sun as
+    mass state ``i``. By day ``P(nu_alpha -> nu_beta) = sum_i c_i |U_{beta i}|^2``; at
+    night see :func:`probability_solar`.
 
-    ``method="sum"`` diagonalises the Hamiltonian at every radius with weight above
-    1e-14 of the peak. ``method="convolution"`` uses that the matter term is
-    ``n_e`` times a fixed matrix (also with NSI and for antineutrinos, but not for
-    sterile flavors with ``rho_yn``): the composition then depends on energy and
-    density only through ``A = 2 E V_CC``, and the average is a correlation in
-    ``ln A``, computed by FFT on a grid of spacing 5e-4 (error ~1e-8). It needs
-    concrete energies; gradients in ``params`` are exact.
+    Neutrinos are assumed to follow their matter eigenstates (non-crossing, so the
+    k-th lowest leaves as the k-th lightest mass state). This fails at narrow avoided
+    crossings, e.g. small active-sterile mixing at Delta m^2_41 ~ 1e-5-1e-4 eV^2; on
+    concrete inputs the function warns when :func:`adiabaticity` drops below
+    ``GAMMA_WARN``.
+
+    ``method="sum"`` diagonalises at every radius and is differentiable in ``params``,
+    the profile and the weights. ``method="convolution"`` needs a matter term equal to
+    ``n_e`` times a fixed matrix (NSI defined relative to ``n_e`` and antineutrinos
+    included; not steriles with ``rho_yn``): the composition then depends only on
+    ``A = 2 E V_CC``, and the average is an FFT correlation in ``ln A`` (error ~1e-8).
+    It needs concrete energies, profile and weights; gradients in ``params`` are exact.
     """
-    w = np.asarray(weights, dtype=float)
-    rho_ye = np.asarray(profile.rho_ye, dtype=float)
-    keep = (w > _WEIGHT_FLOOR * w.max()) & (rho_ye > 0)
-    w = w[keep] / w[keep].sum()
+    _check_weights(weights, profile)
     u, msq = params.pmns(), params.msquared()
     n, na = msq.shape[0], _n_active(params)
     nsi_mat = _nsi_matrix(nsi, na)
@@ -173,39 +230,67 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
         if profile.rho_yn is not None and na < n:
             raise ValueError("method='convolution' needs a matter term proportional to n_e; "
                              "sterile flavors with rho_yn need method='sum'")
-        c = _convolution_mixing(u, msq, energy_GeV, rho_ye[keep], w, alpha, anti, nsi_mat, na)
+        if not (_is_concrete(weights) and _is_concrete(profile.rho_ye)):
+            raise ValueError("method='convolution' needs concrete weights and profile; use method='sum' "
+                             "to differentiate with respect to them")
+        w, rho_ye = np.asarray(weights, dtype=float), np.asarray(profile.rho_ye, dtype=float)
+        keep = (w > _WEIGHT_FLOOR * w.max()) & (rho_ye > 0)
+        c = _convolution_mixing(u, msq, energy_GeV, rho_ye[keep], w[keep] / w[keep].sum(), alpha, anti, nsi_mat, na)
     elif method == "sum":
-        v_cc = C.matter_potential_eV(jnp.asarray(rho_ye[keep]), 1.0)
-        v_nc = (jnp.zeros_like(v_cc) if profile.rho_yn is None
-                else 0.5 * C.matter_potential_eV(jnp.asarray(np.asarray(profile.rho_yn)[keep]), 1.0))
+        r = jnp.asarray(profile.r_over_rsun)
+        if _is_concrete(weights):
+            # Fixed by the weights alone, so the profile stays differentiable.
+            w_np = np.asarray(weights, dtype=float)
+            keep = np.flatnonzero(w_np > _WEIGHT_FLOOR * w_np.max())
+            w, r = jnp.asarray(w_np[keep]), r[keep]
+        else:
+            w = jnp.asarray(weights)
+            w = jnp.where(w > _WEIGHT_FLOOR * jnp.max(w), w, 0.0)
+        v_cc, v_nc = _potentials_eV(profile, r)
+        w = w / jnp.sum(w)
 
         def at_energy(e_eV):
-            vecs = jax.vmap(lambda v, vn: _matter_eigvecs(u, msq, e_eV, v, vn, anti, nsi_mat, na))(v_cc, v_nc)
-            return jnp.asarray(w) @ (jnp.abs(vecs[:, alpha, :]) ** 2)
+            vecs = jnp.linalg.eigh(_hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi_mat))[1]
+            return w @ (jnp.abs(vecs[:, alpha, :]) ** 2)
 
         energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
         c = at_energy(energy_eV) if energy_eV.ndim == 0 else jax.vmap(at_energy)(energy_eV)
     else:
         raise ValueError(f"unknown method {method!r}; choose 'sum' or 'convolution'")
+    _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi)
     # k-th lowest matter eigenstate -> k-th lightest mass state.
     return jnp.zeros_like(c).at[..., jnp.argsort(msq)].set(c)
 
 
+def _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi):
+    """Warn when the adiabaticity drops below ``GAMMA_WARN`` (concrete inputs only)."""
+    leaves = jax.tree_util.tree_leaves((params, energy_GeV, profile, weights, nsi))
+    if not all(_is_concrete(x) for x in leaves):
+        return
+    w = np.asarray(weights, dtype=float)
+    r_min = float(np.asarray(profile.r_over_rsun)[np.argmax(w > _WEIGHT_FLOOR * w.max())])
+    e = np.unique(np.asarray(energy_GeV, dtype=float).ravel())
+    e = e[np.unique(np.linspace(0, len(e) - 1, min(len(e), _GAMMA_ENERGIES)).round().astype(int))]
+    gamma = np.asarray(adiabaticity(params, e, profile, r_min=r_min, anti=anti, nsi=nsi))
+    if np.min(gamma) < GAMMA_WARN:
+        warnings.warn(f"production_mixing: adiabaticity parameter down to {np.min(gamma):.3g} at "
+                      f"{1e3 * e[np.argmin(gamma)]:.3g} MeV (below {GAMMA_WARN:g}); Landau-Zener jumps make the "
+                      "adiabatic result unreliable", stacklevel=3)
 
-def probability_solar(params, energy_GeV, profile, weights, cos_zenith=None, anti=False, nsi=None,
+
+def probability_solar(params, energy_GeV, profile, weights, cos_zenith=None, alpha=0, anti=False, nsi=None,
                       flavor_out=None, method="sum", **earth_options):
-    """``P(nu_e -> nu_beta)`` for solar neutrinos from one source, by day or at night.
+    """``P(nu_alpha -> nu_beta)`` for solar neutrinos from one source, by day or at night.
 
-    ``profile`` and ``weights`` are as in :func:`production_mixing`, and so is
-    ``method``. Neutrinos leave the Sun as an incoherent mixture of vacuum mass
-    states; by day (``cos_zenith=None``) they reach the detector in vacuum, at
-    night they cross the Earth as in :func:`probability_earth`, which takes the
-    remaining keyword arguments (``det_depth_km``, ``earth_model``, ``n_sub``, ...).
-    Returns ``P[..., beta]`` with shape ``([n_E,] N)`` by day and
-    ``([n_cz,] [n_E,] N)`` at night, or the ``flavor_out`` entry alone.
+    Arguments as in :func:`production_mixing`. With ``cos_zenith`` (the Sun's, negative
+    at night) the mass states cross the Earth as in :func:`probability_earth`, which
+    takes ``earth_options``. Returns ``P[..., beta]``, shape ``([n_E,] N)`` by day and
+    ``([n_cz,] [n_E,] N)`` at night, or the ``flavor_out`` entry.
     """
     _check_flavor_index(flavor_out, n_flavors(params), "flavor_out")
-    c = production_mixing(params, energy_GeV, profile, weights, anti=anti, nsi=nsi, method=method)
+    if cos_zenith is None and earth_options:
+        raise TypeError(f"Earth options {sorted(earth_options)} need cos_zenith; by day there is no Earth crossing")
+    c = production_mixing(params, energy_GeV, profile, weights, alpha=alpha, anti=anti, nsi=nsi, method=method)
     if cos_zenith is None:
         p = c @ (jnp.abs(params.pmns()) ** 2).T
     else:
@@ -241,5 +326,5 @@ def _convolution_mixing(u, msq, energy_GeV, rho_ye, w, alpha, anti, nsi, n_activ
     kernel_fft = jnp.asarray(np.fft.rfft(kernel[::-1], n_fft))
     corr = jnp.fft.irfft(jnp.fft.rfft(h.T, n_fft) * kernel_fft, n_fft)[:, m - 1:n_pad]
     grid = jnp.asarray(u_lo + _DU * np.arange(n_out))
-    out = jnp.stack([jnp.interp(jnp.asarray(u_e), grid, corr[c]) for c in range(corr.shape[0])], axis=-1)
+    out = jax.vmap(jnp.interp, in_axes=(None, None, 0))(jnp.asarray(u_e), grid, corr).T
     return out.reshape(energy.shape + (corr.shape[0],))

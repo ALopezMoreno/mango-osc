@@ -1,6 +1,7 @@
 """Tests for neutron densities on solar profiles and production-averaged adiabatic mixing."""
 
 import dataclasses
+import warnings
 import os
 
 import numpy as np
@@ -151,3 +152,116 @@ def test_probability_solar(params):
         assert np.max(np.abs(night[i] - _night_reference(params, c, cz))) < 1e-11
     pee = probability_solar(params, ENERGY, PROFILE, WEIGHTS, cos_zenith=-0.3, flavor_out=0, method="convolution")
     assert np.max(np.abs(np.asarray(pee) - night[1, :, 0])) < 1e-7
+
+
+# --- the adiabatic approximation against exact propagation --------------------
+
+def _sterile4(theta14, dm41, theta24=0.0):
+    p = nufit_no()
+    return Sterile3plus1(theta12=p.theta12, theta13=p.theta13, theta23=p.theta23,
+                         theta14=jnp.asarray(theta14), theta24=jnp.asarray(theta24), theta34=jnp.asarray(0.0),
+                         delta13=p.deltacp, delta24=jnp.asarray(0.0), dm21=p.dm21, dm31=p.dm31,
+                         dm41=jnp.asarray(dm41))
+
+
+def _smooth_profile(n=20001):
+    """Bahcall's exponential n_e, with n_n = 0.4 n_e, finely tabulated."""
+    r = np.linspace(0.0, 1.0, n)
+    ne = 245.0 * np.exp(-10.54 * r)
+    return solar.SolarProfile(r, ne, solar.R_SUN_KM, 0.4 * ne), (lambda x: 245.0 * np.exp(-10.54 * x))
+
+
+def _exact_fractions(params, energy_GeV, density, r0, n_layers=40000, neutrons=0.0):
+    """|(U^dag S)_{i e}|^2 for nu_e propagated through thin layers from r0 [R_sun] to the surface."""
+    from mango.layers import propagate_layers
+    edges = np.linspace(r0, 1.0, n_layers + 1)
+    ne = density(0.5 * (edges[1:] + edges[:-1]))
+    u, msq = params.pmns(), params.msquared()
+    s = propagate_layers(u, msq, energy_GeV * C.GEV_TO_EV, C.matter_potential_eV(jnp.asarray(ne), 1.0),
+                         jnp.asarray(np.diff(edges) * solar.R_SUN_KM * C.KM_TO_INV_EV),
+                         v_nc=0.5 * C.matter_potential_eV(jnp.asarray(neutrons * ne), 1.0),
+                         n_active=getattr(params, "n_active", 3), backend="eigh")
+    return np.abs(np.conj(np.asarray(u)).T @ np.asarray(s)[:, 0]) ** 2
+
+
+def _at(profile, r0):
+    w = np.zeros(len(profile.r_over_rsun))
+    w[np.argmin(np.abs(np.asarray(profile.r_over_rsun) - r0))] = 1.0
+    return w
+
+
+def test_adiabatic_against_exact_propagation_bs05():
+    """3 flavors from r = 0.05 through the BS05 table: adiabatic and exact agree to ~3e-5."""
+    p, r = nufit_no(), np.asarray(PROFILE.r_over_rsun)
+    w = _at(PROFILE, 0.05)
+    exact = _exact_fractions(p, 0.01, lambda x: np.interp(x, r, np.asarray(PROFILE.rho_ye)), r[np.argmax(w)])
+    assert np.max(np.abs(np.asarray(solar.production_mixing(p, 0.01, PROFILE, w)) - exact)) < 1e-4
+
+
+@pytest.mark.parametrize("theta14, energy, tol", [(0.1, 0.01, 1e-4), (0.05, 0.01, 1e-4)])
+def test_adiabatic_steriles_against_exact_propagation(theta14, energy, tol):
+    """Adiabatic sterile resonances (gamma ~ 10-50) on a smooth profile: no warning, exact to ~1e-5."""
+    profile, density = _smooth_profile()
+    p, w = _sterile4(theta14, 1e-4), _at(profile, 0.05)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got = np.asarray(solar.production_mixing(p, energy, profile, w))
+    assert np.max(np.abs(got - _exact_fractions(p, energy, density, 0.05, neutrons=0.4))) < tol
+
+
+def test_nonadiabatic_steriles_warn():
+    """theta14 = 0.02 at 1e-4 eV^2, 10 MeV: gamma ~ 1.8, Landau-Zener jumps, and a warning."""
+    profile, density = _smooth_profile()
+    p, w = _sterile4(0.02, 1e-4), _at(profile, 0.05)
+    with pytest.warns(UserWarning, match="adiabaticity"):
+        got = np.asarray(solar.production_mixing(p, 0.01, profile, w))
+    assert np.max(np.abs(got - _exact_fractions(p, 0.01, density, 0.05, neutrons=0.4))) > 1e-2
+
+
+def test_adiabaticity_two_flavor():
+    """Two flavors, exponential profile: gamma = a D^3 / (beta sin 2theta |d ln n_e/dx|), minimal at
+    beta = (cos 2theta + sqrt(cos^2 2theta + 8)) / 4, just past the resonance."""
+    p = dataclasses.replace(nufit_no(), theta13=0.0)
+    profile, _ = _smooth_profile()
+    c2, s2, e = np.cos(2 * float(p.theta12)), np.sin(2 * float(p.theta12)), 0.01
+    a = float(p.dm21) / (2 * e * C.GEV_TO_EV)
+    slope = 10.54 / (solar.R_SUN_KM * C.KM_TO_INV_EV)           # |d ln n_e / dx| [eV]
+    beta = (c2 + np.sqrt(c2 ** 2 + 8)) / 4
+    expected = a * ((c2 - beta) ** 2 + s2 ** 2) ** 1.5 / (beta * s2 * slope)
+    assert float(solar.adiabaticity(p, e, profile)) == pytest.approx(expected, rel=1e-3)
+
+
+# --- inputs ---------------------------------------------------------------------
+
+def test_weight_validation():
+    p = nufit_no()
+    for bad, match in ((WEIGHTS[:-1], "one entry per profile radius"), (-WEIGHTS, "non-negative"),
+                       (0 * WEIGHTS, "not all be zero")):
+        with pytest.raises(ValueError, match=match):
+            solar.production_mixing(p, ENERGY, PROFILE, bad)
+
+
+def test_profile_gradient():
+    """method='sum' is differentiable in the solar model and in the weights."""
+    p, e = nufit_no(), 0.008
+
+    def c_e(scale, tilt):
+        prof = PROFILE._replace(rho_ye=scale * jnp.asarray(PROFILE.rho_ye))
+        return solar.production_mixing(p, e, prof, jnp.asarray(WEIGHTS) * jnp.exp(tilt * jnp.asarray(R)))[1]
+
+    g = jax.grad(c_e, argnums=(0, 1))(1.0, 0.0)
+    h = 1e-5
+    for i, fd in enumerate(((c_e(1 + h, 0.0) - c_e(1 - h, 0.0)) / (2 * h), (c_e(1.0, h) - c_e(1.0, -h)) / (2 * h))):
+        assert float(g[i]) == pytest.approx(float(fd), rel=1e-5)
+    with pytest.raises(ValueError, match="concrete"):
+        jax.grad(lambda s: solar.production_mixing(p, e, PROFILE._replace(rho_ye=s * jnp.asarray(PROFILE.rho_ye)),
+                                                   WEIGHTS, method="convolution")[1])(1.0)
+
+
+def test_probability_solar_options():
+    p = nufit_no()
+    with pytest.raises(TypeError, match="cos_zenith"):
+        probability_solar(p, ENERGY, PROFILE, WEIGHTS, det_depth_km=1.0)
+    mu = np.asarray(probability_solar(p, ENERGY, PROFILE, WEIGHTS, alpha=1))
+    c = np.asarray(solar.production_mixing(p, ENERGY, PROFILE, WEIGHTS, alpha=1))
+    assert np.max(np.abs(mu - c @ np.abs(np.asarray(p.pmns())).T ** 2)) < 1e-12

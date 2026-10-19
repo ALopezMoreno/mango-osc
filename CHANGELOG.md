@@ -27,9 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `probability_earth`), from `production_mixing` and `mass_states=True`.
   Checked against independent matrix exponentials for both orderings.
 - **Neutron density on solar profiles.** `SolarProfile` has an optional
-  `rho_yn = rho (1 - Y_e)`, filled by `load_bs05`; with it, sterile flavors feel
-  the neutral-current term in `adiabatic_mass_fractions` and
-  `production_mixing`. Sterile results from `load_bs05` profiles change.
+  `rho_yn = rho (1 - Y_e)`, filled by `load_bs05`.
+- **`solar.adiabaticity`**: the smallest adiabaticity parameter on the way out
+  of the Sun; `production_mixing` warns below 10.
+
+### Changed
+
+- **Sterile results from `load_bs05` profiles change**: with `rho_yn`, sterile
+  flavors feel the neutral-current term in `adiabatic_mass_fractions`.
+  `profile._replace(rho_yn=None)` gives the previous behaviour.
 
 ### Fixed
 
