@@ -167,6 +167,9 @@ mango.probability_earth(params, E, cz,
 # arbitrary piecewise-constant profile (source -> detector ordering)
 mango.probability_profile(params, E, density_gcc=[...], ye=[...], length_km=[...])
 
+# mass eigenstates entering instead of flavours (solar neutrinos at night): P[..., beta, i] = P(nu_i -> nu_beta)
+mango.probability_earth(params, E, cz, mass_states=True)
+
 # solar adiabatic MSW: vacuum mass-state fractions vs radius
 prof = mango.solar.load_bs05("examples/data/bs05_agsop.dat")
 F = mango.solar.adiabatic_mass_fractions(params, E_GeV, prof, r_km, r_emit_km)

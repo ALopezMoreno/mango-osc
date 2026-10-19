@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`mass_states=True`** on `probability_profile` and `probability_earth`: the
+  initial index is a vacuum mass eigenstate, `P[..., beta, i] = |(S U)_{beta i}|^2`
+  (`U*` for antineutrinos), as solar neutrinos reach the Earth at night. It
+  agrees with independent matrix exponentials to 1e-12 (1e-11 on PREM chords)
+  and reduces to `|U_{beta i}|^2` in vacuum (`tests/test_mass_states.py`).
+
 ## [0.2.4] - 2026-08-04
 
 ### Fixed
