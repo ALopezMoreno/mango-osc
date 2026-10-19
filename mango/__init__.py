@@ -17,6 +17,7 @@ from .earth import LayeredEarth, prem_layered  # noqa: E402
 from . import globes as globes  # noqa: E402  (generic GLoBES/AEDL loader)
 from . import nufast as nufast  # noqa: E402  (fast analytic constant-density)
 from . import solar  # noqa: E402  (solar profile + adiabatic MSW)
+from .solar import probability_solar  # noqa: E402
 from . import ode  # noqa: E402  (continuous-density backend)
 from . import nsi as nsi  # noqa: E402  (non-standard interactions)
 from . import sterile as sterile  # noqa: E402  (3+N sterile front-end)
@@ -51,6 +52,7 @@ __all__ = [
     "probability_vacuum",
     "probability_profile",
     "probability_earth",
+    "probability_solar",
     "select",
     "NSI",
     "Decoherence",

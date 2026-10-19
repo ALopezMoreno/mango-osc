@@ -14,6 +14,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`U*` for antineutrinos), as solar neutrinos reach the Earth at night. It
   agrees with independent matrix exponentials to 1e-12 (1e-11 on PREM chords)
   and reduces to `|U_{beta i}|^2` in vacuum (`tests/test_mass_states.py`).
+- **`solar.production_mixing`**: the adiabatic vacuum mass-state fractions of
+  solar neutrinos averaged over a source's production region, from production
+  weights on a `SolarProfile`. `method="sum"` diagonalises at every radius;
+  `method="convolution"` uses that the matter term is `n_e` times a fixed matrix
+  (three or more active flavors, NSI, antineutrinos) and averages by an FFT
+  correlation in `ln(2 E V_CC)`, at a cost independent of the number of
+  energies (1e-8 from the sum). Matter eigenstates map to mass states by their
+  order, which also holds for inverted ordering (`tests/test_solar_production.py`).
+- **`probability_solar`**: `P(nu_e -> nu_beta)` for solar neutrinos from a
+  production region, by day or at night through the Earth (with the options of
+  `probability_earth`), from `production_mixing` and `mass_states=True`.
+  Checked against independent matrix exponentials for both orderings.
+- **Neutron density on solar profiles.** `SolarProfile` has an optional
+  `rho_yn = rho (1 - Y_e)`, filled by `load_bs05`; with it, sterile flavors feel
+  the neutral-current term in `adiabatic_mass_fractions` and
+  `production_mixing`. Sterile results from `load_bs05` profiles change.
+
+### Fixed
+
+- **`adiabatic_mass_fractions` with `anti=True`** conjugated the mixing matrix
+  twice, so antineutrino fractions were wrong for a CP phase other than 0 or pi
+  (by 4e-3 at the NuFIT best fit).
 
 ## [0.2.4] - 2026-08-04
 
