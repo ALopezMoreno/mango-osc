@@ -70,14 +70,14 @@ def test_neutron_density():
 @pytest.mark.parametrize("params", [nufit_no(), _inverted(nufit_no())], ids=["NO", "IO"])
 def test_sum_against_brute_force(params):
     for alpha in (0, 1):
-        got = np.asarray(solar.production_mixing(params, ENERGY, PROFILE, WEIGHTS, alpha=alpha))
+        got = np.asarray(solar.production_mixing(params, ENERGY, PROFILE, WEIGHTS, alpha=alpha, method="sum"))
         assert np.max(np.abs(got - _brute(params, alpha))) < 1e-12
         assert np.max(np.abs(got.sum(axis=-1) - 1.0)) < 1e-12
 
 
 def test_antineutrinos():
     p = nufit_no()
-    got = np.asarray(solar.production_mixing(p, ENERGY, PROFILE, WEIGHTS, anti=True))
+    got = np.asarray(solar.production_mixing(p, ENERGY, PROFILE, WEIGHTS, anti=True, method="sum"))
     assert np.max(np.abs(got - _brute(p, anti=True))) < 1e-12
     # adiabatic_mass_fractions at the surface, from one emission radius, against the same construction
     r_sun = PROFILE.R_sun_km
@@ -94,19 +94,19 @@ def test_antineutrinos():
 
 def test_steriles_feel_neutrons():
     st = _sterile()
-    got = np.asarray(solar.production_mixing(st, ENERGY, PROFILE, WEIGHTS))
+    got = np.asarray(solar.production_mixing(st, ENERGY, PROFILE, WEIGHTS, method="sum"))
     assert np.max(np.abs(got - _brute(st, neutrons=True))) < 1e-12
     blind = PROFILE._replace(rho_yn=None)
-    assert np.max(np.abs(got - np.asarray(solar.production_mixing(st, ENERGY, blind, WEIGHTS)))) > 1e-6
-    with pytest.raises(ValueError):
-        solar.production_mixing(st, ENERGY, PROFILE, WEIGHTS, method="convolution")
+    assert np.max(np.abs(got - np.asarray(solar.production_mixing(st, ENERGY, blind, WEIGHTS, method="sum")))) > 1e-6
+    conv = solar.production_mixing(st, ENERGY, PROFILE, WEIGHTS, method="convolution")
+    assert np.max(np.abs(np.asarray(conv) - got)) < 1e-5
 
 
 @pytest.mark.parametrize("kw", [dict(), dict(alpha=2), dict(anti=True), dict(nsi=NSI(eps_ee=0.3, eps_etau=0.1)),
                                 dict(params=_inverted(nufit_no()))], ids=["NO", "alpha", "anti", "NSI", "IO"])
 def test_convolution_matches_sum(kw):
     params = kw.pop("params", nufit_no())
-    exact = solar.production_mixing(params, ENERGY, PROFILE, WEIGHTS, **kw)
+    exact = solar.production_mixing(params, ENERGY, PROFILE, WEIGHTS, **kw, method="sum")
     fast = solar.production_mixing(params, ENERGY, PROFILE, WEIGHTS, method="convolution", **kw)
     assert np.max(np.abs(np.asarray(fast - exact))) < 1e-7
 
@@ -143,10 +143,10 @@ def _night_reference(params, c, cz):
 @pytest.mark.parametrize("params", [nufit_no(), _inverted(nufit_no())], ids=["NO", "IO"])
 def test_probability_solar(params):
     c = _brute(params)
-    day = np.asarray(probability_solar(params, ENERGY, PROFILE, WEIGHTS))
+    day = np.asarray(probability_solar(params, ENERGY, PROFILE, WEIGHTS, method="sum"))
     assert np.max(np.abs(day - c @ np.abs(np.asarray(params.pmns())).T ** 2)) < 1e-12
     assert np.max(np.abs(day.sum(axis=-1) - 1.0)) < 1e-12
-    night = np.asarray(probability_solar(params, ENERGY, PROFILE, WEIGHTS, cos_zenith=np.array([-0.9, -0.3])))
+    night = np.asarray(probability_solar(params, ENERGY, PROFILE, WEIGHTS, cos_zenith=np.array([-0.9, -0.3]), method="sum"))
     assert night.shape == (2, len(ENERGY), 3)
     for i, cz in enumerate((-0.9, -0.3)):
         assert np.max(np.abs(night[i] - _night_reference(params, c, cz))) < 1e-11
@@ -195,7 +195,7 @@ def test_adiabatic_against_exact_propagation_bs05():
     p, r = nufit_no(), np.asarray(PROFILE.r_over_rsun)
     w = _at(PROFILE, 0.05)
     exact = _exact_fractions(p, 0.01, lambda x: np.interp(x, r, np.asarray(PROFILE.rho_ye)), r[np.argmax(w)])
-    assert np.max(np.abs(np.asarray(solar.production_mixing(p, 0.01, PROFILE, w)) - exact)) < 1e-4
+    assert np.max(np.abs(np.asarray(solar.production_mixing(p, 0.01, PROFILE, w, method="sum")) - exact)) < 1e-4
 
 
 @pytest.mark.parametrize("theta14, energy, tol", [(0.1, 0.01, 1e-4), (0.05, 0.01, 1e-4)])
@@ -205,7 +205,7 @@ def test_adiabatic_steriles_against_exact_propagation(theta14, energy, tol):
     p, w = _sterile4(theta14, 1e-4), _at(profile, 0.05)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        got = np.asarray(solar.production_mixing(p, energy, profile, w))
+        got = np.asarray(solar.production_mixing(p, energy, profile, w, method="sum"))
     assert np.max(np.abs(got - _exact_fractions(p, energy, density, 0.05, neutrons=0.4))) < tol
 
 
@@ -214,7 +214,7 @@ def test_nonadiabatic_steriles_warn():
     profile, density = _smooth_profile()
     p, w = _sterile4(0.02, 1e-4), _at(profile, 0.05)
     with pytest.warns(UserWarning, match="adiabaticity"):
-        got = np.asarray(solar.production_mixing(p, 0.01, profile, w))
+        got = np.asarray(solar.production_mixing(p, 0.01, profile, w, method="sum"))
     assert np.max(np.abs(got - _exact_fractions(p, 0.01, density, 0.05, neutrons=0.4))) > 1e-2
 
 
@@ -247,7 +247,7 @@ def test_profile_gradient():
 
     def c_e(scale, tilt):
         prof = PROFILE._replace(rho_ye=scale * jnp.asarray(PROFILE.rho_ye))
-        return solar.production_mixing(p, e, prof, jnp.asarray(WEIGHTS) * jnp.exp(tilt * jnp.asarray(R)))[1]
+        return solar.production_mixing(p, e, prof, jnp.asarray(WEIGHTS) * jnp.exp(tilt * jnp.asarray(R)), method="sum")[1]
 
     g = jax.grad(c_e, argnums=(0, 1))(1.0, 0.0)
     h = 1e-5
@@ -265,3 +265,52 @@ def test_probability_solar_options():
     mu = np.asarray(probability_solar(p, ENERGY, PROFILE, WEIGHTS, alpha=1))
     c = np.asarray(solar.production_mixing(p, ENERGY, PROFILE, WEIGHTS, alpha=1))
     assert np.max(np.abs(mu - c @ np.abs(np.asarray(p.pmns())).T ** 2)) < 1e-12
+
+
+# --- method="auto" ----------------------------------------------------------------
+
+E_AUTO = np.exp(np.linspace(np.log(4e-3), np.log(14e-3), 8))
+
+
+@pytest.mark.parametrize("theta14", [0.01, 0.03])
+def test_auto_switches_to_exact(theta14):
+    """Non-adiabatic resonances (gamma ~ 0.4 and ~2.5): auto matches exact layered propagation, unlike the sum."""
+    profile, density = _smooth_profile(4001)
+    r = np.asarray(profile.r_over_rsun)
+    p, w = _sterile4(theta14, 1e-4), _at(profile, 0.05)
+    k = np.argmax(w)
+    radii = np.linspace(0.5 * (r[k - 1] + r[k]), 0.5 * (r[k] + r[k + 1]), 12)    # the weight's grid shell
+    exact = np.stack([np.mean([_exact_fractions(p, e, density, x, n_layers=20000, neutrons=0.4) for x in radii], axis=0)
+                      for e in E_AUTO[::2]])
+    got = np.asarray(solar.production_mixing(p, E_AUTO, profile, w))[::2]
+    assert np.max(np.abs(got - exact)) < 1e-3
+    with pytest.warns(UserWarning, match="method='auto'"):
+        adiabatic = np.asarray(solar.production_mixing(p, E_AUTO, profile, w, method="sum"))[::2]
+    assert np.max(np.abs(adiabatic - exact)) > 1e-3
+
+
+def test_auto_adiabatic():
+    """Adiabatic cases stay adiabatic: auto equals the sum, for continua and for lines."""
+    for p, kw in ((nufit_no(), {}), (_sterile(), {}), (nufit_no(), dict(anti=True)),
+                  (nufit_no(), dict(nsi=NSI(eps_ee=0.3, eps_etau=0.1)))):
+        for e in (ENERGY, np.array([0.384e-3, 0.862e-3])):
+            got = solar.production_mixing(p, e, PROFILE, WEIGHTS, **kw)
+            assert np.max(np.abs(np.asarray(got - solar.production_mixing(p, e, PROFILE, WEIGHTS, method="sum", **kw)))) < 2e-5
+
+
+@pytest.mark.parametrize("theta14", [0.3, 0.01])
+def test_auto_gradient(theta14):
+    """Reverse-mode gradients through the adiabatic (0.3) and exact (0.01) branches."""
+    profile, _ = _smooth_profile()
+    w = np.exp(-0.5 * ((np.asarray(profile.r_over_rsun) - 0.045) / 0.015) ** 2)
+
+    def f(t):
+        return solar.production_mixing(_sterile4(t, 1e-4), E_AUTO, profile, w, tol=1e-2)[:, 3].sum()
+
+    h = 1e-6
+    assert float(jax.grad(f)(theta14)) == pytest.approx(float((f(theta14 + h) - f(theta14 - h)) / (2 * h)), rel=1e-6)
+
+
+def test_auto_needs_concrete_inputs():
+    with pytest.raises(ValueError, match="concrete"):
+        jax.grad(lambda s: solar.production_mixing(nufit_no(), ENERGY, PROFILE, s * jnp.asarray(WEIGHTS))[0, 1])(1.0)

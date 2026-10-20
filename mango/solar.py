@@ -27,7 +27,9 @@ import jax.numpy as jnp
 
 from . import constants as C
 from .hamiltonian import matter_hamiltonian
-from .oscillator import _check_flavor_index, _is_concrete, _n_active, _nsi_matrix, n_flavors, probability_earth
+from .oscillator import (_check_flavor_index, _is_concrete, _n_active, _nsi_matrix, _resolve_backend, n_flavors,
+                         probability_earth)
+from .propagator import propagator
 
 R_SUN_KM = 695700.0
 
@@ -199,8 +201,9 @@ def _gamma_min(params, energy_eV, x, v_cc, v_nc, nsi, anti):
     return jax.vmap(at_energy)(energy_eV)
 
 
-def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False, nsi=None, method="sum"):
-    """Adiabatic vacuum mass-state fractions of solar neutrinos, averaged over a production region.
+def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False, nsi=None, method="auto",
+                      tol=1e-3):
+    """Vacuum mass-state fractions of solar neutrinos, averaged over a production region.
 
     ``weights`` are production fractions per point of ``profile.r_over_rsun`` (already
     integrated over each grid shell, not a density dPhi/dr). Returns ``c[..., i]``,
@@ -208,34 +211,50 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
     mass state ``i``. By day ``P(nu_alpha -> nu_beta) = sum_i c_i |U_{beta i}|^2``; at
     night see :func:`probability_solar`.
 
-    Neutrinos are assumed to follow their matter eigenstates (non-crossing, so the
-    k-th lowest leaves as the k-th lightest mass state). This fails at narrow avoided
-    crossings, e.g. small active-sterile mixing at Delta m^2_41 ~ 1e-5-1e-4 eV^2; on
-    concrete inputs the function warns when :func:`adiabaticity` drops below
-    ``GAMMA_WARN``.
+    ``method="auto"`` is accurate to ``tol`` (1e-3 or 1e-2) whatever the physics. It
+    computes the adiabatic result (by ``"convolution"``, or by ``"sum"`` for at most four
+    energies, e.g. lines), checks it at a few energies on the profile grid (resolved
+    and adiabatic eigenstates, agreement with the exact adiabatic sum), and otherwise
+    returns ``"exact"``, through ``jax.lax.cond`` so only one branch runs and gradients
+    flow through either. It needs concrete energies, profile and weights.
 
-    ``method="sum"`` diagonalises at every radius and is differentiable in ``params``,
-    the profile and the weights. ``method="convolution"`` needs a matter term equal to
-    ``n_e`` times a fixed matrix (NSI defined relative to ``n_e`` and antineutrinos
-    included; not steriles with ``rho_yn``): the composition then depends only on
-    ``A = 2 E V_CC``, and the average is an FFT correlation in ``ln A`` (error ~1e-8).
-    It needs concrete energies, profile and weights; gradients in ``params`` are exact.
+    ``method="sum"`` and ``"convolution"`` are adiabatic only: neutrinos follow their
+    matter eigenstates, which fails at narrow avoided crossings (e.g. small
+    active-sterile mixing at Delta m^2_41 ~ 1e-5-1e-4 eV^2); they warn when
+    :func:`adiabaticity` drops below ``GAMMA_WARN``. ``"sum"`` diagonalises at every
+    radius and is differentiable in the profile and weights. ``"convolution"`` uses
+    that the matter term is ``n_e (M0 + y M1)``, ``y = n_n / n_e``: for each ``y`` the
+    composition depends only on ``A = 2 E V_CC``, so the average is an FFT correlation
+    in ``ln A``, Lagrange-interpolated over Chebyshev nodes in ``y`` (one node without
+    sterile neutral currents). ``method="exact"`` propagates through ``n_layers`` thin
+    layers of a monotone-cubic profile from the innermost production radius.
     """
     _check_weights(weights, profile)
-    u, msq = params.pmns(), params.msquared()
-    n, na = msq.shape[0], _n_active(params)
-    nsi_mat = _nsi_matrix(nsi, na)
+    if method == "auto":
+        return _auto_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi, tol)
+    if method == "exact":
+        return _exact_mixing(params, energy_GeV, profile, weights, alpha, anti, _nsi_matrix(nsi, _n_active(params)),
+                             _exact_layers(tol))
+    c = _adiabatic_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi, method)
+    _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi)
+    return c
 
+
+def _adiabatic_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi, method, n_y=9, du=_DU):
+    """Adiabatic fractions by ``"sum"`` or ``"convolution"``, ordered by mass state."""
+    u, msq = params.pmns(), params.msquared()
+    na = _n_active(params)
+    nsi_mat = _nsi_matrix(nsi, na)
     if method == "convolution":
-        if profile.rho_yn is not None and na < n:
-            raise ValueError("method='convolution' needs a matter term proportional to n_e; "
-                             "sterile flavors with rho_yn need method='sum'")
         if not (_is_concrete(weights) and _is_concrete(profile.rho_ye)):
             raise ValueError("method='convolution' needs concrete weights and profile; use method='sum' "
                              "to differentiate with respect to them")
         w, rho_ye = np.asarray(weights, dtype=float), np.asarray(profile.rho_ye, dtype=float)
         keep = (w > _WEIGHT_FLOOR * w.max()) & (rho_ye > 0)
-        c = _convolution_mixing(u, msq, energy_GeV, rho_ye[keep], w[keep] / w[keep].sum(), alpha, anti, nsi_mat, na)
+        y = (None if profile.rho_yn is None or na == msq.shape[0]
+             else np.asarray(profile.rho_yn, dtype=float)[keep] / rho_ye[keep])
+        c = _convolution_mixing(params, energy_GeV, rho_ye[keep], y, w[keep] / w[keep].sum(), alpha, anti, nsi_mat,
+                                n_y, du)
     elif method == "sum":
         r = jnp.asarray(profile.r_over_rsun)
         if _is_concrete(weights):
@@ -256,10 +275,130 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
         energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
         c = at_energy(energy_eV) if energy_eV.ndim == 0 else jax.vmap(at_energy)(energy_eV)
     else:
-        raise ValueError(f"unknown method {method!r}; choose 'sum' or 'convolution'")
-    _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi)
+        raise ValueError(f"unknown method {method!r}; choose 'auto', 'sum', 'convolution' or 'exact'")
     # k-th lowest matter eigenstate -> k-th lightest mass state.
     return jnp.zeros_like(c).at[..., jnp.argsort(msq)].set(c)
+
+
+# --- method="auto": adiabatic, checked, exact otherwise --------------------------------------
+
+_AUTO_LINES = 4          # at most this many energies: the adiabatic sum instead of the convolution
+_AUTO_CHECKS = 5         # Chebyshev energies of the check
+_OVERLAP_MIN = 0.999     # eigenstates rotate by at most ~0.03 rad between profile grid points
+_GAMMA_MIN = 50.0        # adiabaticity with a factor ~2.5 margin (errors reach 1e-3 near gamma ~ 15)
+
+
+def _exact_layers(tol):
+    return 20000 if tol < 1e-2 else 5000
+
+
+def _auto_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi, tol):
+    if not all(_is_concrete(x) for x in (energy_GeV, weights, profile.rho_ye, profile.rho_yn)):
+        raise ValueError("method='auto' needs concrete energies, profile and weights; use method='sum' to "
+                         "differentiate with respect to the profile or weights")
+    energy = np.asarray(energy_GeV, dtype=float)
+    e_flat = np.unique(energy.ravel())
+    if e_flat.size <= _AUTO_LINES:
+        e_check, method = e_flat, "sum"
+    else:
+        x = np.cos(np.pi * np.arange(_AUTO_CHECKS) / (_AUTO_CHECKS - 1))
+        lo, hi = np.log(e_flat[0]), np.log(e_flat[-1])
+        e_check, method = np.exp(0.5 * (hi - lo) * x + 0.5 * (hi + lo)), "convolution"
+    # ln A spacing 5e-3 gives ~1e-6 and 7 y nodes ~1e-5 where adiabatic, well inside tol.
+    both = _adiabatic_mixing(params, np.concatenate([energy.ravel(), e_check]), profile, weights, alpha, anti, nsi,
+                             method, n_y=7, du=5e-3 if tol < 1e-2 else 1e-2)
+    c_fast, c_check = both[:energy.size].reshape(energy.shape + both.shape[-1:]), both[energy.size:]
+    # The check only chooses the branch, so it needs no derivatives.
+    sg = jax.lax.stop_gradient
+    ok = _adiabatic_check(jax.tree_util.tree_map(sg, params), e_check, profile, weights, alpha, anti,
+                          None if nsi is None else jax.tree_util.tree_map(sg, nsi), sg(c_check), 0.2 * tol)
+    na = _n_active(params)
+    # Checkpointed, so that the adiabatic branch does not carry the exact branch's residuals in reverse mode.
+    exact = jax.checkpoint(lambda q, ns: _exact_mixing(q, energy, profile, weights, alpha, anti, _nsi_matrix(ns, na),
+                                                       _exact_layers(tol)))
+    return jax.lax.cond(ok, lambda: c_fast, lambda: exact(params, nsi))
+
+
+def _adiabatic_check(params, e_check, profile, weights, alpha, anti, nsi, c_check, sum_tol):
+    """True when the adiabatic result holds at ``e_check``: eigenstates resolved by the profile grid,
+    adiabaticity above ``_GAMMA_MIN``, and agreement with the exact adiabatic sum to ``sum_tol``."""
+    w = np.asarray(weights, dtype=float)
+    r = np.asarray(profile.r_over_rsun, dtype=float)
+    sel = np.flatnonzero(r >= r[np.argmax(w > _WEIGHT_FLOOR * w.max())])
+    x = jnp.asarray(r[sel] * profile.R_sun_km * C.KM_TO_INV_EV)
+    v_cc, v_nc = _potentials_eV(profile, jnp.asarray(r[sel]))
+    prod = w[sel] > _WEIGHT_FLOOR * w.max()
+    w_prod = jnp.asarray(np.where(prod, w[sel], 0.0) / w[sel][prod].sum())
+    nsi_mat = _nsi_matrix(nsi, _n_active(params))
+    msq = params.msquared()
+    iu = np.triu_indices(msq.shape[0], 1)
+
+    def at_energy(e_eV, c_e):
+        h = _hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi_mat)
+        lam, vec = jnp.linalg.eigh(h)
+        overlap = jnp.min(jnp.abs(jnp.einsum("jak,jak->jk", jnp.conj(vec[:-1]), vec[1:])) ** 2)
+        dh = (h[1:] - h[:-1]) / jnp.diff(x)[:, None, None]
+        coupling = jnp.abs(jnp.einsum("jai,jab,jbk->jik", jnp.conj(vec[:-1]), dh, vec[:-1]))[:, iu[0], iu[1]]
+        gap2 = ((lam[:-1, :, None] - lam[:-1, None, :]) ** 2)[:, iu[0], iu[1]]
+        gamma = jnp.min(gap2 / (2.0 * jnp.maximum(coupling, 1e-300)))
+        c_sum = w_prod @ (jnp.abs(vec[:, alpha, :]) ** 2)
+        c_sum = jnp.zeros_like(c_sum).at[jnp.argsort(msq)].set(c_sum)
+        return (overlap > _OVERLAP_MIN) & (gamma > _GAMMA_MIN) & (jnp.max(jnp.abs(c_sum - c_e)) < sum_tol)
+
+    return jnp.all(jax.vmap(at_energy)(jnp.asarray(e_check) * C.GEV_TO_EV, c_check))
+
+
+def _pchip(x, y, xq):
+    """Monotone cubic (Fritsch-Carlson) interpolation of ``y(x)`` at ``xq``."""
+    h, d = np.diff(x), np.diff(y) / np.diff(x)
+    m = np.zeros_like(y)
+    same = d[:-1] * d[1:] > 0
+    w1, w2 = 2 * h[1:] + h[:-1], h[1:] + 2 * h[:-1]
+    m[1:-1] = np.where(same, (w1 + w2) / (w1 / np.where(same, d[:-1], 1) + w2 / np.where(same, d[1:], 1)), 0.0)
+    m[0], m[-1] = d[0], d[-1]
+    i = np.clip(np.searchsorted(x, xq) - 1, 0, len(x) - 2)
+    t = (xq - x[i]) / h[i]
+    return ((2 * t ** 3 - 3 * t ** 2 + 1) * y[i] + (t ** 3 - 2 * t ** 2 + t) * h[i] * m[i]
+            + (-2 * t ** 3 + 3 * t ** 2) * y[i + 1] + (t ** 3 - t ** 2) * h[i] * m[i + 1])
+
+
+def _exact_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi, n_layers):
+    """Exact fractions: thin layers from the innermost production radius to the surface, with
+    ``S(edge -> surface) = S_total C_edge^dag`` from the cumulative products, summed incoherently."""
+    w = np.asarray(weights, dtype=float)
+    r = np.asarray(profile.r_over_rsun, dtype=float)
+    # Each weight is spread uniformly over its grid point's shell, bounded by the midpoints to its neighbours.
+    shells = np.concatenate([r[:1], 0.5 * (r[1:] + r[:-1]), r[-1:]])
+    first = np.argmax(w > _WEIGHT_FLOOR * w.max())
+    edges = np.linspace(shells[first], r[-1], n_layers + 1)
+    mid = 0.5 * (edges[1:] + edges[:-1])
+    cdf = np.interp(np.concatenate([edges[:1], mid, edges[-1:]]), shells, np.concatenate([[0.0], np.cumsum(w)]))
+    f = jnp.asarray(np.diff(cdf) / w.sum())                      # production at each layer edge
+    rho_ye = np.exp(_pchip(r, np.log(np.asarray(profile.rho_ye, dtype=float)), mid))
+    v_cc = C.matter_potential_eV(jnp.asarray(rho_ye), 1.0)
+    v_nc = (jnp.zeros_like(v_cc) if profile.rho_yn is None else 0.5 * C.matter_potential_eV(
+        jnp.asarray(np.exp(_pchip(r, np.log(np.asarray(profile.rho_yn, dtype=float)), mid))), 1.0))
+    length = jnp.asarray(np.diff(edges) * profile.R_sun_km * C.KM_TO_INV_EV)
+    u, msq = params.pmns(), params.msquared()
+    n, na = msq.shape[0], _n_active(params)
+    u_in = jnp.conj(u) if anti else u
+    backend = _resolve_backend(params, "cayley")
+
+    def at_energy(e_eV):
+        def step(carry, xs):
+            vc, vn, l = xs
+            h = matter_hamiltonian(u, msq, e_eV, vc, anti=anti, nsi=nsi, v_nc_eV=vn, n_active=na)
+            carry = propagator(h, l, backend=backend) @ carry
+            return carry, carry
+        eye = jnp.eye(n, dtype=jnp.complex128)
+        s_total, cum = jax.lax.scan(step, eye, (v_cc, v_nc, length))
+        cum = jnp.concatenate([eye[None], cum])
+        amp = jnp.einsum("ab,jcb->jac", s_total, jnp.conj(cum))[:, :, alpha]
+        return f @ (jnp.abs(amp @ jnp.conj(u_in)) ** 2)
+
+    energy = np.asarray(energy_GeV, dtype=float)
+    out = jax.vmap(at_energy)(jnp.asarray(energy.ravel()) * C.GEV_TO_EV)
+    return out.reshape(energy.shape + out.shape[-1:])
 
 
 def _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi):
@@ -275,11 +414,11 @@ def _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi):
     if np.min(gamma) < GAMMA_WARN:
         warnings.warn(f"production_mixing: adiabaticity parameter down to {np.min(gamma):.3g} at "
                       f"{1e3 * e[np.argmin(gamma)]:.3g} MeV (below {GAMMA_WARN:g}); Landau-Zener jumps make the "
-                      "adiabatic result unreliable", stacklevel=3)
+                      "adiabatic result unreliable; method='auto' handles this", stacklevel=3)
 
 
 def probability_solar(params, energy_GeV, profile, weights, cos_zenith=None, alpha=0, anti=False, nsi=None,
-                      flavor_out=None, method="sum", **earth_options):
+                      flavor_out=None, method="auto", tol=1e-3, **earth_options):
     """``P(nu_alpha -> nu_beta)`` for solar neutrinos from one source, by day or at night.
 
     Arguments as in :func:`production_mixing`. With ``cos_zenith`` (the Sun's, negative
@@ -290,7 +429,8 @@ def probability_solar(params, energy_GeV, profile, weights, cos_zenith=None, alp
     _check_flavor_index(flavor_out, n_flavors(params), "flavor_out")
     if cos_zenith is None and earth_options:
         raise TypeError(f"Earth options {sorted(earth_options)} need cos_zenith; by day there is no Earth crossing")
-    c = production_mixing(params, energy_GeV, profile, weights, alpha=alpha, anti=anti, nsi=nsi, method=method)
+    c = production_mixing(params, energy_GeV, profile, weights, alpha=alpha, anti=anti, nsi=nsi, method=method,
+                          tol=tol)
     if cos_zenith is None:
         p = c @ (jnp.abs(params.pmns()) ** 2).T
     else:
@@ -300,31 +440,48 @@ def probability_solar(params, energy_GeV, profile, weights, cos_zenith=None, alp
     return p if flavor_out is None else p[..., flavor_out]
 
 
-def _convolution_mixing(u, msq, energy_GeV, rho_ye, w, alpha, anti, nsi, n_active):
-    """``production_mixing`` by ascending matter eigenstate, as a correlation in ln A."""
+def _convolution_mixing(params, energy_GeV, rho_ye, y, w, alpha, anti, nsi, n_y, du):
+    """Adiabatic fractions by ascending matter eigenstate, as correlations in ln A at Chebyshev nodes in y."""
     energy = np.asarray(energy_GeV, dtype=float)
     if not np.all(np.isfinite(energy)):
         raise ValueError("method='convolution' needs concrete, finite energies")
+    if y is None or np.ptp(y) <= 1e-9 * np.max(np.abs(y)):
+        nodes, lagrange = np.array([0.0 if y is None else np.mean(y)]), np.ones((1, len(w)))
+    else:
+        y0, y1 = y.min(), y.max()
+        nodes = 0.5 * (y0 + y1) + 0.5 * (y1 - y0) * np.cos(np.pi * (np.arange(n_y) + 0.5) / n_y)
+        lagrange = np.stack([np.prod([(y - nodes[k]) / (nodes[j] - nodes[k]) for k in range(n_y) if k != j], axis=0)
+                             for j in range(n_y)])
     # A = 2 E V_CC = k E[GeV] rho_ye, so ln A = ln(k E) + ln rho_ye.
     k = 2.0 * C.GEV_TO_EV * C.matter_potential_eV(1.0, 1.0)
     v = np.log(rho_ye)
     v_min = v.min()
-    m = int(np.ceil((v.max() - v_min) / _DU)) + 2
-    pos = (v - v_min) / _DU
+    m = int(np.ceil((v.max() - v_min) / du)) + 2
+    pos = (v - v_min) / du
     lo = np.floor(pos).astype(int)
-    kernel = np.zeros(m)
-    np.add.at(kernel, lo, w * (1.0 - (pos - lo)))
-    np.add.at(kernel, lo + 1, w * (pos - lo))
+    kernels = np.zeros((len(nodes), m))
+    for j in range(len(nodes)):
+        np.add.at(kernels[j], lo, w * lagrange[j] * (1.0 - (pos - lo)))
+        np.add.at(kernels[j], lo + 1, w * lagrange[j] * (pos - lo))
     u_e = np.log(k * energy.ravel())
-    u_lo = np.floor((u_e.min() - 0.01) / _DU) * _DU
-    n_out = int(np.ceil((u_e.max() + 0.01 - u_lo) / _DU)) + 1
+    u_lo = np.floor((u_e.min() - 0.01) / du) * du
+    n_out = int(np.ceil((u_e.max() + 0.01 - u_lo) / du)) + 1
     n_pad = n_out + m - 1
-    A = jnp.asarray(np.exp(u_lo + v_min + _DU * np.arange(n_pad)))
-    # Eigenvectors of H and of 2 E H = U diag(msq) U^dag + A (matter matrix) coincide: E = 1/2 eV, V = A.
-    h = jax.vmap(lambda a: jnp.abs(_matter_eigvecs(u, msq, 0.5, a, 0.0, anti, nsi, n_active)[alpha]) ** 2)(A)
+    A = jnp.asarray(np.exp(u_lo + v_min + du * np.arange(n_pad)))
+    u, msq = params.pmns(), params.msquared()
+    na = _n_active(params)
+
+    # Eigenvectors of H and of 2 E H = U diag(msq) U^dag + A (matter matrix) coincide: E = 1/2 eV, V_CC = A,
+    # V_NC = y A / 2.
+    def h_at(y_node):
+        return jax.vmap(lambda a: jnp.abs(_matter_eigvecs(u, msq, 0.5, a, 0.5 * y_node * a, anti, nsi, na)[alpha])
+                        ** 2)(A)
+
+    h = jax.vmap(h_at)(jnp.asarray(nodes))
     n_fft = int(2 ** np.ceil(np.log2(n_pad + m - 1)))
-    kernel_fft = jnp.asarray(np.fft.rfft(kernel[::-1], n_fft))
-    corr = jnp.fft.irfft(jnp.fft.rfft(h.T, n_fft) * kernel_fft, n_fft)[:, m - 1:n_pad]
-    grid = jnp.asarray(u_lo + _DU * np.arange(n_out))
+    kernel_fft = jnp.asarray(np.fft.rfft(kernels[:, ::-1], n_fft, axis=1))
+    corr = jnp.fft.irfft(jnp.fft.rfft(jnp.swapaxes(h, 1, 2), n_fft, axis=-1) * kernel_fft[:, None, :], n_fft,
+                         axis=-1).sum(0)[:, m - 1:n_pad]
+    grid = jnp.asarray(u_lo + du * np.arange(n_out))
     out = jax.vmap(jnp.interp, in_axes=(None, None, 0))(jnp.asarray(u_e), grid, corr).T
     return out.reshape(energy.shape + (corr.shape[0],))

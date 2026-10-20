@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `rho_yn = rho (1 - Y_e)`, filled by `load_bs05`.
 - **`solar.adiabaticity`**: the smallest adiabaticity parameter on the way out
   of the Sun; `production_mixing` warns below 10.
+- **`method="auto"`** (the default) in `production_mixing` and
+  `probability_solar`: accurate to `tol` (1e-3, or 1e-2 for e.g. hep) whatever
+  the physics. The adiabatic result (convolution, or the sum for lines) is
+  checked in the trace at a few energies, and replaced through `jax.lax.cond` by
+  exact layered propagation where adiabaticity fails; gradients flow through
+  either branch. `method="exact"` gives the latter directly. The convolution
+  now covers steriles with `rho_yn` and any matter term
+  `n_e (M0 + (n_n / n_e) M1)`.
 
 ### Changed
 
