@@ -264,11 +264,13 @@ def test_decoupled_sterile_matches_3nu(dm41, ordering, anti):
 def test_blocks():
     """nu_3 with theta13 = 0 has no nu_e component, so the potential never moves it: its own block."""
     p = nufit_no()
-    label = lambda q, neutrons=False: list(np.asarray(solar._blocks(q.pmns(), q.msquared(), getattr(q, "n_active", 3),
-                                                                     None, neutrons)[0]))
+
+    def label(q, neutrons=False):
+        return list(np.asarray(solar._blocks(q.pmns(), q.msquared(), getattr(q, "n_active", 3), None, neutrons)[0]))
+
     assert label(p) == [0, 0, 0]
-    assert label(dataclasses.replace(p, theta13=0.0)) == [0, 0, 2]
-    assert label(_decoupled(p, 1e-4), True) == [0, 0, 0, 3]
+    assert label(dataclasses.replace(p, theta13=0.0)) == [0, 0, 1]
+    assert label(_decoupled(p, 1e-4), True) == [0, 0, 0, 1]
     assert label(_sterile4(1e-6, 1e-4), True) == [0, 0, 0, 0]
 
 

@@ -106,26 +106,32 @@ def _blocks(u, msq, n_active, nsi, neutrons):
     cc = jnp.zeros((n, n), jnp.complex128).at[0, 0].set(1.0)
     if nsi is not None:
         cc = cc.at[:n_active, :n_active].add(jnp.asarray(nsi, jnp.complex128))
-    ops = [cc] + ([jnp.diag((jnp.arange(n) >= n_active).astype(jnp.complex128))] if neutrons and n_active < n else [])
+    ops = [cc]
+    if neutrons and n_active < n:
+        ops.append(jnp.diag((jnp.arange(n) >= n_active).astype(jnp.complex128)))
     link = jnp.eye(n, dtype=bool)
     for p in ops:
         link = link | (jnp.abs(jnp.conj(u).T @ p @ u) > 0)
     for _ in range(max(1, int(np.ceil(np.log2(n))))):
         link = (link.astype(jnp.int32) @ link.astype(jnp.int32)) > 0
-    label = jnp.argmax(link, axis=1)
+    first = jnp.argmax(link, axis=1)                       # lowest mass index in each state's block
+    label = jnp.cumsum(jnp.zeros(n, jnp.int32).at[first].set(1)).take(first) - 1   # blocks numbered 0, 1, ...
     return label, jnp.lexsort((msq, label))
 
 
 def _block_shift(u, msq, label, energy_eV, v_max, nsi, anti):
-    """A constant per block, above the eigenvalue spread of ``H``: commutes with ``H``, and ``eigh`` then
-    returns (block, eigenvalue) order. Zero for a single block."""
-    scale = 4.0 * (jnp.ptp(msq) / (2.0 * energy_eV) + v_max * (1.0 + (0.0 if nsi is None else jnp.sum(jnp.abs(nsi)))))
+    """A constant per block, above the eigenvalue spread of ``H``, so ``eigh`` returns (block, eigenvalue) order.
+
+    It commutes with ``H``, so the eigenvectors are unchanged; zero for a single block.
+    """
+    nsi_norm = 0.0 if nsi is None else jnp.sum(jnp.abs(nsi))
+    scale = 4.0 * (jnp.ptp(msq) / (2.0 * energy_eV) + v_max * (1.0 + nsi_norm))
     ue = jnp.conj(u) if anti else jnp.asarray(u, jnp.complex128)
     return (ue * (scale * label)) @ jnp.conj(ue).T
 
 
 def _matter_eigvecs(u, msq, energy_eV, v_cc, v_nc, anti, nsi, n_active, shift=0.0):
-    """Matter eigenstates in the flavor basis (columns, ascending eigenvalue)."""
+    """Matter eigenstates in the flavor basis (columns, ascending eigenvalue; (block, eigenvalue) with ``shift``)."""
     h = matter_hamiltonian(u, msq, energy_eV, v_cc, anti=anti, nsi=nsi, v_nc_eV=v_nc, n_active=n_active)
     return jnp.linalg.eigh(h + shift)[1]
 
@@ -148,7 +154,7 @@ def adiabatic_mass_fractions(params, energy_GeV, profile, r_km,
     na = _n_active(params)
     energy_eV = energy_GeV * C.GEV_TO_EV
     label, _ = _blocks(u, msq, na, None, profile.rho_yn is not None)
-    v_max = jnp.max(jnp.abs(jnp.stack(_potentials_eV(profile, profile.r_over_rsun))))
+    v_max = jnp.max(jnp.abs(jnp.concatenate(_potentials_eV(profile, profile.r_over_rsun))))
     shift = _block_shift(u, msq, label, energy_eV, v_max, None, anti)
 
     def eigvecs(r):
