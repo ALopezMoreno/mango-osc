@@ -96,10 +96,38 @@ def _potentials_eV(profile, r_over_rsun):
     return v_cc, 0.5 * C.matter_potential_eV(jnp.interp(x, grid, jnp.asarray(profile.rho_yn)), 1.0)
 
 
-def _matter_eigvecs(u, msq, energy_eV, v_cc, v_nc, anti, nsi, n_active):
+def _blocks(u, msq, n_active, nsi, neutrons):
+    """Block label per mass state, and the mass states in (block, m^2) order.
+
+    ``H(r) = H_0 + sum_j V_j(r) P_j`` with ``H_0`` diagonal in the mass basis, so mass states share a block
+    when some ``U^dagger P_j U`` links them, directly or not. Levels of different blocks may cross.
+    """
+    n = msq.shape[0]
+    cc = jnp.zeros((n, n), jnp.complex128).at[0, 0].set(1.0)
+    if nsi is not None:
+        cc = cc.at[:n_active, :n_active].add(jnp.asarray(nsi, jnp.complex128))
+    ops = [cc] + ([jnp.diag((jnp.arange(n) >= n_active).astype(jnp.complex128))] if neutrons and n_active < n else [])
+    link = jnp.eye(n, dtype=bool)
+    for p in ops:
+        link = link | (jnp.abs(jnp.conj(u).T @ p @ u) > 0)
+    for _ in range(max(1, int(np.ceil(np.log2(n))))):
+        link = (link.astype(jnp.int32) @ link.astype(jnp.int32)) > 0
+    label = jnp.argmax(link, axis=1)
+    return label, jnp.lexsort((msq, label))
+
+
+def _block_shift(u, msq, label, energy_eV, v_max, nsi, anti):
+    """A constant per block, above the eigenvalue spread of ``H``: commutes with ``H``, and ``eigh`` then
+    returns (block, eigenvalue) order. Zero for a single block."""
+    scale = 4.0 * (jnp.ptp(msq) / (2.0 * energy_eV) + v_max * (1.0 + (0.0 if nsi is None else jnp.sum(jnp.abs(nsi)))))
+    ue = jnp.conj(u) if anti else jnp.asarray(u, jnp.complex128)
+    return (ue * (scale * label)) @ jnp.conj(ue).T
+
+
+def _matter_eigvecs(u, msq, energy_eV, v_cc, v_nc, anti, nsi, n_active, shift=0.0):
     """Matter eigenstates in the flavor basis (columns, ascending eigenvalue)."""
     h = matter_hamiltonian(u, msq, energy_eV, v_cc, anti=anti, nsi=nsi, v_nc_eV=v_nc, n_active=n_active)
-    return jnp.linalg.eigh(h)[1]
+    return jnp.linalg.eigh(h + shift)[1]
 
 
 def adiabatic_mass_fractions(params, energy_GeV, profile, r_km,
@@ -119,11 +147,14 @@ def adiabatic_mass_fractions(params, energy_GeV, profile, r_km,
     u, msq = params.pmns(), params.msquared()
     na = _n_active(params)
     energy_eV = energy_GeV * C.GEV_TO_EV
+    label, _ = _blocks(u, msq, na, None, profile.rho_yn is not None)
+    v_max = jnp.max(jnp.abs(jnp.stack(_potentials_eV(profile, profile.r_over_rsun))))
+    shift = _block_shift(u, msq, label, energy_eV, v_max, None, anti)
 
     def eigvecs(r):
         # matter_hamiltonian applies U -> U* and V -> -V itself for antineutrinos.
         v_cc, v_nc = _potentials_eV(profile, jnp.asarray(r) / profile.R_sun_km)
-        return _matter_eigvecs(u, msq, energy_eV, v_cc, v_nc, anti, None, na)
+        return _matter_eigvecs(u, msq, energy_eV, v_cc, v_nc, anti, None, na, shift)
 
     # Production weights w_k = |<nu_k^m(r_emit) | nu_alpha>|^2.
     w = jnp.abs(eigvecs(r_emit_km)[alpha, :]) ** 2  # (N,)
@@ -180,16 +211,20 @@ def adiabaticity(params, energy_GeV, profile, r_min=0.0, anti=False, nsi=None):
     v_cc, v_nc = _potentials_eV(profile, jnp.asarray(r[sel]))
     energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
     return _gamma_min(params, jnp.atleast_1d(energy_eV), x, v_cc, v_nc, _nsi_matrix(nsi, _n_active(params)),
-                      anti).reshape(energy_eV.shape)
+                      anti, profile.rho_yn is not None).reshape(energy_eV.shape)
 
 
-@functools.partial(jax.jit, static_argnames="anti")
-def _gamma_min(params, energy_eV, x, v_cc, v_nc, nsi, anti):
+@functools.partial(jax.jit, static_argnames=("anti", "neutrons"))
+def _gamma_min(params, energy_eV, x, v_cc, v_nc, nsi, anti, neutrons):
     """Minimum over radii and pairs of matter eigenstates of the adiabaticity parameter, per energy."""
-    iu = np.triu_indices(params.msquared().shape[0], 1)
+    u, msq = params.pmns(), params.msquared()
+    iu = np.triu_indices(msq.shape[0], 1)
+    label, _ = _blocks(u, msq, _n_active(params), nsi, neutrons)
+    v_max = jnp.max(jnp.abs(jnp.concatenate([v_cc, v_nc])))
 
     def at_energy(e_eV):
         h = _hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi)
+        h = h + _block_shift(u, msq, label, e_eV, v_max, nsi, anti)
         lam, vec = jnp.linalg.eigh(0.5 * (h[1:] + h[:-1]))
         dh = (h[1:] - h[:-1]) / jnp.diff(x)[:, None, None]
         coupling = jnp.abs(jnp.einsum("rai,rab,rbj->rij", jnp.conj(vec), dh, vec))[:, iu[0], iu[1]]
@@ -199,7 +234,8 @@ def _gamma_min(params, energy_eV, x, v_cc, v_nc, nsi, anti):
     return jax.vmap(at_energy)(energy_eV)
 
 
-def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False, nsi=None, method="sum"):
+def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False, nsi=None, method="sum",
+                      check_adiabaticity=True):
     """Adiabatic vacuum mass-state fractions of solar neutrinos, averaged over a production region.
 
     ``weights`` are production fractions per point of ``profile.r_over_rsun`` (already
@@ -208,11 +244,12 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
     mass state ``i``. By day ``P(nu_alpha -> nu_beta) = sum_i c_i |U_{beta i}|^2``; at
     night see :func:`probability_solar`.
 
-    Neutrinos are assumed to follow their matter eigenstates (non-crossing, so the
-    k-th lowest leaves as the k-th lightest mass state). This fails at narrow avoided
+    Neutrinos are assumed to follow their matter eigenstates: within each block of
+    the Hamiltonian, the k-th lowest leaves as the k-th lightest mass state (a
+    sterile with all ``theta_i4 = 0`` is its own block). This fails at narrow avoided
     crossings, e.g. small active-sterile mixing at Delta m^2_41 ~ 1e-5-1e-4 eV^2; on
     concrete inputs the function warns when :func:`adiabaticity` drops below
-    ``GAMMA_WARN``.
+    ``GAMMA_WARN``, unless ``check_adiabaticity=False``.
 
     ``method="sum"`` diagonalises at every radius and is differentiable in ``params``,
     the profile and the weights. ``method="convolution"`` needs a matter term equal to
@@ -225,6 +262,7 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
     u, msq = params.pmns(), params.msquared()
     n, na = msq.shape[0], _n_active(params)
     nsi_mat = _nsi_matrix(nsi, na)
+    label, mass_order = _blocks(u, msq, na, nsi_mat, profile.rho_yn is not None)
 
     if method == "convolution":
         if profile.rho_yn is not None and na < n:
@@ -235,7 +273,8 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
                              "to differentiate with respect to them")
         w, rho_ye = np.asarray(weights, dtype=float), np.asarray(profile.rho_ye, dtype=float)
         keep = (w > _WEIGHT_FLOOR * w.max()) & (rho_ye > 0)
-        c = _convolution_mixing(u, msq, energy_GeV, rho_ye[keep], w[keep] / w[keep].sum(), alpha, anti, nsi_mat, na)
+        c = _convolution_mixing(u, msq, energy_GeV, rho_ye[keep], w[keep] / w[keep].sum(), alpha, anti, nsi_mat, na,
+                                label)
     elif method == "sum":
         r = jnp.asarray(profile.r_over_rsun)
         if _is_concrete(weights):
@@ -248,18 +287,21 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
             w = jnp.where(w > _WEIGHT_FLOOR * jnp.max(w), w, 0.0)
         v_cc, v_nc = _potentials_eV(profile, r)
         w = w / jnp.sum(w)
+        v_max = jnp.max(jnp.abs(jnp.concatenate([v_cc, v_nc])))
 
         def at_energy(e_eV):
-            vecs = jnp.linalg.eigh(_hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi_mat))[1]
+            shift = _block_shift(u, msq, label, e_eV, v_max, nsi_mat, anti)
+            vecs = jnp.linalg.eigh(_hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi_mat) + shift)[1]
             return w @ (jnp.abs(vecs[:, alpha, :]) ** 2)
 
         energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
         c = at_energy(energy_eV) if energy_eV.ndim == 0 else jax.vmap(at_energy)(energy_eV)
     else:
         raise ValueError(f"unknown method {method!r}; choose 'sum' or 'convolution'")
-    _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi)
-    # k-th lowest matter eigenstate -> k-th lightest mass state.
-    return jnp.zeros_like(c).at[..., jnp.argsort(msq)].set(c)
+    if check_adiabaticity:
+        _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi)
+    # k-th matter eigenstate in (block, eigenvalue) order -> k-th mass state in (block, m^2) order.
+    return jnp.zeros_like(c).at[..., mass_order].set(c)
 
 
 def _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi):
@@ -279,7 +321,7 @@ def _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi):
 
 
 def probability_solar(params, energy_GeV, profile, weights, cos_zenith=None, alpha=0, anti=False, nsi=None,
-                      flavor_out=None, method="sum", **earth_options):
+                      flavor_out=None, method="sum", check_adiabaticity=True, **earth_options):
     """``P(nu_alpha -> nu_beta)`` for solar neutrinos from one source, by day or at night.
 
     Arguments as in :func:`production_mixing`. With ``cos_zenith`` (the Sun's, negative
@@ -290,7 +332,8 @@ def probability_solar(params, energy_GeV, profile, weights, cos_zenith=None, alp
     _check_flavor_index(flavor_out, n_flavors(params), "flavor_out")
     if cos_zenith is None and earth_options:
         raise TypeError(f"Earth options {sorted(earth_options)} need cos_zenith; by day there is no Earth crossing")
-    c = production_mixing(params, energy_GeV, profile, weights, alpha=alpha, anti=anti, nsi=nsi, method=method)
+    c = production_mixing(params, energy_GeV, profile, weights, alpha=alpha, anti=anti, nsi=nsi, method=method,
+                          check_adiabaticity=check_adiabaticity)
     if cos_zenith is None:
         p = c @ (jnp.abs(params.pmns()) ** 2).T
     else:
@@ -300,8 +343,8 @@ def probability_solar(params, energy_GeV, profile, weights, cos_zenith=None, alp
     return p if flavor_out is None else p[..., flavor_out]
 
 
-def _convolution_mixing(u, msq, energy_GeV, rho_ye, w, alpha, anti, nsi, n_active):
-    """``production_mixing`` by ascending matter eigenstate, as a correlation in ln A."""
+def _convolution_mixing(u, msq, energy_GeV, rho_ye, w, alpha, anti, nsi, n_active, label):
+    """``production_mixing`` by matter eigenstate, as a correlation in ln A."""
     energy = np.asarray(energy_GeV, dtype=float)
     if not np.all(np.isfinite(energy)):
         raise ValueError("method='convolution' needs concrete, finite energies")
@@ -321,7 +364,8 @@ def _convolution_mixing(u, msq, energy_GeV, rho_ye, w, alpha, anti, nsi, n_activ
     n_pad = n_out + m - 1
     A = jnp.asarray(np.exp(u_lo + v_min + _DU * np.arange(n_pad)))
     # Eigenvectors of H and of 2 E H = U diag(msq) U^dag + A (matter matrix) coincide: E = 1/2 eV, V = A.
-    h = jax.vmap(lambda a: jnp.abs(_matter_eigvecs(u, msq, 0.5, a, 0.0, anti, nsi, n_active)[alpha]) ** 2)(A)
+    shift = _block_shift(u, msq, label, 0.5, A[-1], nsi, anti)
+    h = jax.vmap(lambda a: jnp.abs(_matter_eigvecs(u, msq, 0.5, a, 0.0, anti, nsi, n_active, shift)[alpha]) ** 2)(A)
     n_fft = int(2 ** np.ceil(np.log2(n_pad + m - 1)))
     kernel_fft = jnp.asarray(np.fft.rfft(kernel[::-1], n_fft))
     corr = jnp.fft.irfft(jnp.fft.rfft(h.T, n_fft) * kernel_fft, n_fft)[:, m - 1:n_pad]

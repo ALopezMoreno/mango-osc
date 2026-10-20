@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (three or more active flavors, NSI, antineutrinos) and averages by an FFT
   correlation in `ln(2 E V_CC)`, at a cost independent of the number of
   energies (1e-8 from the sum). Matter eigenstates map to mass states by their
-  order, which also holds for inverted ordering (`tests/test_solar_production.py`).
+  order within each block of the Hamiltonian, which also holds for inverted
+  ordering (`tests/test_solar_production.py`).
 - **`probability_solar`**: `P(nu_e -> nu_beta)` for solar neutrinos from a
   production region, by day or at night through the Earth (with the options of
   `probability_earth`), from `production_mixing` and `mass_states=True`.
@@ -29,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Neutron density on solar profiles.** `SolarProfile` has an optional
   `rho_yn = rho (1 - Y_e)`, filled by `load_bs05`.
 - **`solar.adiabaticity`**: the smallest adiabaticity parameter on the way out
-  of the Sun; `production_mixing` warns below 10.
+  of the Sun; `production_mixing` warns below 10 unless `check_adiabaticity=False`.
 
 ### Changed
 
@@ -42,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`adiabatic_mass_fractions` with `anti=True`** conjugated the mixing matrix
   twice, so antineutrino fractions were wrong for a CP phase other than 0 or pi
   (by 4e-3 at the NuFIT best fit).
+- **`adiabatic_mass_fractions` with decoupled states**: levels in different
+  blocks of the Hamiltonian can cross, so eigenstates are now ranked within
+  blocks; 3+1 with all `theta_i4 = 0` gives the 3-flavor result.
 
 ## [0.2.4] - 2026-08-04
 

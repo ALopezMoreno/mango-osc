@@ -231,6 +231,68 @@ def test_adiabaticity_two_flavor():
     assert float(solar.adiabaticity(p, e, profile)) == pytest.approx(expected, rel=1e-3)
 
 
+# --- blocks: mass states that no potential couples --------------------------------
+
+def _decoupled(p3, dm41):
+    """3+1 with all theta_i4 = 0 on top of the 3-flavor point p3: nu_4 never couples."""
+    return Sterile3plus1(theta12=p3.theta12, theta13=p3.theta13, theta23=p3.theta23,
+                         theta14=jnp.asarray(0.0), theta24=jnp.asarray(0.0), theta34=jnp.asarray(0.0),
+                         delta13=p3.deltacp, delta24=jnp.asarray(0.0), dm21=p3.dm21, dm31=p3.dm31,
+                         dm41=jnp.asarray(dm41))
+
+
+@pytest.mark.parametrize("dm41", [1e-5, 1e-4, 1e-2])
+@pytest.mark.parametrize("ordering", ["NO", "IO"])
+@pytest.mark.parametrize("anti", [False, True])
+def test_decoupled_sterile_matches_3nu(dm41, ordering, anti):
+    """The decoupled sterile level crosses the active ones: 3+1 must still give 3nu, without a warning."""
+    p3 = nufit_no() if ordering == "NO" else _inverted(nufit_no())
+    p4, e = _decoupled(p3, dm41), np.linspace(1e-3, 15e-3, 15)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for profile, method in ((PROFILE, "sum"), (PROFILE._replace(rho_yn=None), "convolution")):
+            c3 = np.asarray(solar.production_mixing(p3, e, profile, WEIGHTS, anti=anti, method=method))
+            c4 = np.asarray(solar.production_mixing(p4, e, profile, WEIGHTS, anti=anti, method=method))
+            assert np.max(np.abs(c4[:, :3] - c3)) < 1e-12 and np.max(c4[:, 3]) < 1e-12
+    r_sun = PROFILE.R_sun_km
+    for energy in (0.002, 0.01):
+        f3, f4 = (np.asarray(solar.adiabatic_mass_fractions(p, energy, PROFILE, 0.999 * r_sun, 0.05 * r_sun,
+                                                            anti=anti)) for p in (p3, p4))
+        assert np.max(np.abs(f4[:3] - f3)) < 1e-12 and f4[3] < 1e-12
+
+
+def test_blocks():
+    """nu_3 with theta13 = 0 has no nu_e component, so the potential never moves it: its own block."""
+    p = nufit_no()
+    label = lambda q, neutrons=False: list(np.asarray(solar._blocks(q.pmns(), q.msquared(), getattr(q, "n_active", 3),
+                                                                     None, neutrons)[0]))
+    assert label(p) == [0, 0, 0]
+    assert label(dataclasses.replace(p, theta13=0.0)) == [0, 0, 2]
+    assert label(_decoupled(p, 1e-4), True) == [0, 0, 0, 3]
+    assert label(_sterile4(1e-6, 1e-4), True) == [0, 0, 0, 0]
+
+
+def test_decoupled_gradient():
+    """d/d theta12 of the 3+1 result with theta_i4 = 0 equals the 3-flavor one."""
+    e = np.linspace(3e-3, 15e-3, 5)
+
+    def c_e(theta12, p):
+        return solar.production_mixing(dataclasses.replace(p, theta12=theta12), e, PROFILE, WEIGHTS)[:, 1].sum()
+
+    p3 = nufit_no()
+    g3 = jax.grad(c_e)(p3.theta12, p3)
+    g4 = jax.grad(c_e)(p3.theta12, _decoupled(p3, 1e-4))
+    assert float(g4) == pytest.approx(float(g3), rel=1e-10)
+
+
+def test_check_adiabaticity_off():
+    profile, _ = _smooth_profile()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        solar.production_mixing(_sterile4(0.02, 1e-4), 0.01, profile, _at(profile, 0.05), check_adiabaticity=False)
+        probability_solar(_sterile4(0.02, 1e-4), 0.01, profile, _at(profile, 0.05), check_adiabaticity=False)
+
+
 # --- inputs ---------------------------------------------------------------------
 
 def test_weight_validation():
