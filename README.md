@@ -167,9 +167,21 @@ mango.probability_earth(params, E, cz,
 # arbitrary piecewise-constant profile (source -> detector ordering)
 mango.probability_profile(params, E, density_gcc=[...], ye=[...], length_km=[...])
 
+# mass eigenstates entering instead of flavours (solar neutrinos at night): P[..., beta, i] = P(nu_i -> nu_beta)
+mango.probability_earth(params, E, cz, mass_states=True)
+
 # solar adiabatic MSW: vacuum mass-state fractions vs radius
 prof = mango.solar.load_bs05("examples/data/bs05_agsop.dat")
 F = mango.solar.adiabatic_mass_fractions(params, E_GeV, prof, r_km, r_emit_km)
+
+# solar neutrinos from a production region: weights are production fractions per point of
+# prof.r_over_rsun (integrated over each shell, e.g. from the model's flux table, not a density dPhi/dr);
+# P(nu_e -> nu_beta) by day, and at night through the Earth on a (n_cz, n_E) grid (adiabatic; see
+# solar.adiabaticity)
+P_day = mango.probability_solar(params, E_GeV, prof, weights)                     # or method="convolution"
+P_ee_night = mango.probability_solar(params, E_GeV, prof, weights, cos_zenith=cz, flavor_out=0)
+# the mass-state fractions leaving the Sun, if needed on their own
+c = mango.solar.production_mixing(params, E_GeV, prof, weights)
 ```
 
 ### NSI and sterile neutrinos

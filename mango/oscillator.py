@@ -235,11 +235,13 @@ def probability_vacuum(params, energy_GeV, baseline_km, anti=False,
 
 def probability_profile(params, energy_GeV, density_gcc, ye, length_km,
                         anti=False, backend="cayley", nsi=None,
-                        flavor_in=None, flavor_out=None):
+                        flavor_in=None, flavor_out=None, mass_states=False):
     """Probabilities through a user-supplied piecewise-constant profile.
 
     ``density_gcc``, ``ye``, ``length_km`` are 1-D arrays (one entry per
     segment, ordered source -> detector).  ``energy_GeV`` is a scalar or array.
+    With ``mass_states=True`` the initial index is a vacuum mass eigenstate,
+    ``P[..., beta, i] = P(nu_i -> nu_beta)`` (see :func:`probability_earth`).
     """
     _check_positive(energy_GeV, "energy_GeV", "GeV, not eV")
     _check_nonneg(density_gcc, "density_gcc", "g/cm^3")
@@ -252,6 +254,7 @@ def probability_profile(params, energy_GeV, density_gcc, ye, length_km,
     v_cc, v_nc = C.matter_potentials(density_gcc, ye)
     length_invEV = jnp.asarray(length_km) * C.KM_TO_INV_EV
     u, msq = params.pmns(), params.msquared()
+    u_in = jnp.conj(u) if anti else u
     na = _n_active(params)
     nsi_mat = _nsi_matrix(nsi, na)
     backend = _resolve_backend(params, backend)
@@ -259,7 +262,7 @@ def probability_profile(params, energy_GeV, density_gcc, ye, length_km,
     def core(e_eV):
         s = propagate_layers(u, msq, e_eV, v_cc, length_invEV, anti=anti,
                              backend=backend, nsi=nsi_mat, v_nc=v_nc, n_active=na)
-        return prob_from_amplitude(s)
+        return prob_from_amplitude(s @ u_in if mass_states else s)
 
     energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
     p = core(energy_eV) if energy_eV.ndim == 0 else jax.vmap(core)(energy_eV)
@@ -290,7 +293,7 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
                       n_sub=4, h_atm_km=0.0, ye_core=_earth.YE_CORE_DEFAULT,
                       ye_mantle=_earth.YE_MANTLE_DEFAULT, earth_model=None,
                       anti=False, backend="cayley", nsi=None,
-                      flavor_in=None, flavor_out=None):
+                      flavor_in=None, flavor_out=None, mass_states=False):
     """Oscillation probabilities through the PREM Earth (and atmosphere).
 
     ``energy_GeV`` and ``cos_zenith`` may each be scalar or 1-D.  With both 1-D
@@ -305,6 +308,11 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
     the detector depth below the surface.  ``nsi`` and sterile ``params`` are
     supported (sterile flavors feel the relative NC potential).
 
+    With ``mass_states=True`` neutrinos enter as vacuum mass eigenstates, as
+    solar neutrinos reach the Earth: ``P[..., beta, i] = |(S U)_{beta i}|^2``
+    (``U*`` for antineutrinos), so ``flavor_in`` is then a mass index.  In
+    vacuum this is ``|U_{beta i}|^2``.
+
     Pass ``earth_model`` (a :class:`mango.earth.LayeredEarth`) to use a fully
     parametric constant-density-shell Earth instead of the fixed PREM polynomials;
     probabilities are then differentiable w.r.t. the **shell boundary radii**,
@@ -316,6 +324,7 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
     _check_flavor_index(flavor_in, n_flavors(params), "flavor_in")
     _check_flavor_index(flavor_out, n_flavors(params), "flavor_out")
     u, msq = params.pmns(), params.msquared()
+    u_in = jnp.conj(u) if anti else u
     na = _n_active(params)
     nsi_mat = _nsi_matrix(nsi, na)
     backend = _resolve_backend(params, backend)
@@ -335,7 +344,7 @@ def probability_earth(params, energy_GeV, cos_zenith, det_depth_km=0.0,
         length_invEV = length_km * C.KM_TO_INV_EV
         s = propagate_layers(u, msq, e_eV, v_cc, length_invEV, anti=anti,
                              backend=backend, nsi=nsi_mat, v_nc=v_nc, n_active=na)
-        return prob_from_amplitude(s)
+        return prob_from_amplitude(s @ u_in if mass_states else s)
 
     energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
     cz = jnp.asarray(cos_zenith, dtype=jnp.float64)
