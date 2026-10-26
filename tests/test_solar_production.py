@@ -329,3 +329,22 @@ def test_probability_solar_options():
     mu = np.asarray(probability_solar(p, ENERGY, PROFILE, WEIGHTS, alpha=1))
     c = np.asarray(solar.production_mixing(p, ENERGY, PROFILE, WEIGHTS, alpha=1))
     assert np.max(np.abs(mu - c @ np.abs(np.asarray(p.pmns())).T ** 2)) < 1e-12
+
+
+SF3 = os.path.join(os.path.dirname(__file__), "..", "examples", "data", "struct+nu_SF3_GS98.dat")
+
+
+def test_sf3_profile():
+    """load_sf3 counts all electrons; load_sf3_production weights are normalised and peak in the core."""
+    prof = solar.load_sf3(SF3)
+    r, ne, nn = (np.asarray(x) for x in (prof.r_over_rsun, prof.rho_ye, prof.rho_yn))
+    free = 10.0 ** solar._sf3_columns(SF3)["log_ne"]
+    assert np.max(np.abs(ne[r < 0.6] / free[r < 0.6] - 1)) < 5e-3 and ne[-1] / free[-1] > 1e3
+    env = (r > 0.75) & (r < 1.0)
+    assert np.ptp(nn[env] / ne[env]) < 1e-3
+    assert prof.R_sun_km == pytest.approx(695985, rel=1e-5)
+    w = solar.load_sf3_production(SF3)
+    assert w.sum() == pytest.approx(1.0, abs=1e-12) and np.all(w >= 0) and 0.04 < r[np.argmax(w)] < 0.05
+    c = np.asarray(solar.production_mixing(nufit_no(), ENERGY, prof, w))
+    c_free = np.asarray(solar.production_mixing(nufit_no(), ENERGY, prof._replace(rho_ye=free), w))
+    assert np.max(np.abs(c - c_free)) < 1e-3                    # three flavors barely see the bound electrons

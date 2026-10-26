@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `rho_yn = rho (1 - Y_e)`, filled by `load_bs05`.
 - **`solar.adiabaticity`**: the smallest adiabaticity parameter on the way out
   of the Sun; `production_mixing` warns below 10 unless `check_adiabaticity=False`.
+- **B23/SF-III solar models**: `solar.load_sf3` and `load_sf3_production`, with
+  the GS98 table in `examples/data/`. Densities count all electrons, not the
+  tables' free-electron `log_ne`.
 
 ### Changed
 

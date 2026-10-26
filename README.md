@@ -172,6 +172,9 @@ mango.probability_earth(params, E, cz, mass_states=True)
 
 # solar adiabatic MSW: vacuum mass-state fractions vs radius
 prof = mango.solar.load_bs05("examples/data/bs05_agsop.dat")
+# or B23/SF-III, with production weights per source on the same rows
+prof = mango.solar.load_sf3("examples/data/struct+nu_SF3_GS98.dat")
+weights = mango.solar.load_sf3_production("examples/data/struct+nu_SF3_GS98.dat", "8B")
 F = mango.solar.adiabatic_mass_fractions(params, E_GeV, prof, r_km, r_emit_km)
 
 # solar neutrinos from a production region: weights are production fractions per point of
@@ -523,7 +526,10 @@ mango/
   [`examples/data/bs05_agsop.dat`](examples/data/bs05_agsop.dat) is that
   published model's own data file, used as input to `mango.solar.load_bs05`
   (`mango/solar.py`), which is otherwise an independent implementation of the
-  textbook averaged-adiabatic MSW formula.
+  textbook averaged-adiabatic MSW formula. Herrera & Serenelli, standard solar
+  models B23/SF-III, [Zenodo 10822316](https://zenodo.org/records/10822316)
+  (CC BY 4.0): [`examples/data/struct+nu_SF3_GS98.dat`](examples/data/struct+nu_SF3_GS98.dat)
+  is the GS98 table of that release, unmodified, read by `mango.solar.load_sf3`.
 
 See [`CITATION.cff`](CITATION.cff) for how to cite this software (and the
 accompanying paper, once available), and [`CHANGELOG.md`](CHANGELOG.md) for

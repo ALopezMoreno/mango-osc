@@ -1,7 +1,7 @@
 """Solar matter profile and adiabatic MSW evolution.
 
-Provides a standard-solar-model electron-density profile (loaded from a BS05-style
-table, or an analytic exponential approximation) and the **adiabatic** mass-state
+Provides a standard-solar-model electron-density profile (loaded from a BS05 or a
+B23/SF-III table, or an analytic exponential approximation) and the **adiabatic** mass-state
 composition of a neutrino produced inside the Sun -- the mechanism behind the LMA
 solar solution. Idea adapted from the nu-waves library. :func:`production_mixing`
 averages that composition over a source's production region, and
@@ -66,6 +66,41 @@ def load_bs05(path):
     X = arr[:, 6]
     ye = 0.5 * (1.0 + X)
     return SolarProfile(r_over_rsun=r, rho_ye=rho * ye, R_sun_km=R_SUN_KM, rho_yn=rho * (1.0 - ye))
+
+
+# (column, Z, A) of the SF-III species; standard atomic weights from Ne on.
+_SF3_SPECIES = (("H1", 1, 1), ("He4", 2, 4), ("He3", 2, 3), ("C12", 6, 12), ("C13", 6, 13), ("N14", 7, 14),
+                ("N15", 7, 15), ("O16", 8, 16), ("O17", 8, 17), ("O18", 8, 18), ("Ne", 10, 20.180),
+                ("Na", 11, 22.990), ("Mg", 12, 24.305), ("Al", 13, 26.982), ("Si", 14, 28.085), ("P", 15, 30.974),
+                ("S", 16, 32.06), ("Cl", 17, 35.45), ("Ar", 18, 39.948), ("K", 19, 39.098), ("Ca", 20, 40.078),
+                ("Sc", 21, 44.956), ("Ti", 22, 47.867), ("V", 23, 50.942), ("Cr", 24, 51.996), ("Mn", 25, 54.938),
+                ("Fe", 26, 55.845), ("Co", 27, 58.933), ("Ni", 28, 58.693))
+
+
+def _sf3_columns(path):
+    with open(path) as f:
+        names = f.readline().strip().lstrip("#").split()
+    return dict(zip(names, np.loadtxt(path).T))
+
+
+def load_sf3(path):
+    """Load a ``struct+nu_SF3_*.dat`` standard solar model table (Herrera & Serenelli, B23/SF-III).
+
+    The densities count all electrons and neutrons of the mass fractions, as the
+    coherent potential does; the table's ``log_ne`` counts free electrons only.
+    """
+    col = _sf3_columns(path)
+    rho = 10.0 ** col["logRho"]
+    ne = rho * sum(col[s] * z / m for s, z, m in _SF3_SPECIES)
+    nn = rho * sum(col[s] * (m - z) / m for s, z, m in _SF3_SPECIES)
+    return SolarProfile(r_over_rsun=col["R_sun"], rho_ye=ne, R_sun_km=10.0 ** col["logR"][-1] / 1e5, rho_yn=nn)
+
+
+def load_sf3_production(path, source="8B"):
+    """Production weights of ``source`` (e.g. ``"8B"``) on the rows of :func:`load_sf3`, summing to 1."""
+    col = _sf3_columns(path)
+    w = np.clip(col[f"nu_{source}"], 0.0, None) * np.gradient(col["R_sun"])   # clip spline noise near r = 0
+    return w / w.sum()
 
 
 def exponential_profile(ne0_over_NA=245.0, scale=10.54, n=400):
