@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Checked against independent matrix exponentials for both orderings.
 - **Neutron density on solar profiles.** `SolarProfile` has an optional
   `rho_yn = rho (1 - Y_e)`, filled by `load_bs05`.
+- **`method="quadratic"`** in `production_mixing` and `probability_solar`: the
+  fractions without the adiabatic assumption (any number of flavors, NSI,
+  steriles), by interaction-picture Magnus steps on a grid fixed by the profile.
+  Jit-able and differentiable; ~1e-5 from thin layers, ~10-20 ms per energy.
 - **`solar.adiabaticity`**: the smallest adiabaticity parameter on the way out
   of the Sun; `production_mixing` warns below 10 unless `check_adiabaticity=False`.
 - **B23/SF-III solar models**: `solar.load_sf3` and `load_sf3_production`, with

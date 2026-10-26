@@ -55,7 +55,7 @@ jaxnu/
   params.py        OscParams PyTree (differentiable leaves)
   nsi.py           matter-NSI parameters (epsilon matrix)            [implemented]
   sterile.py       3+N sterile front-end (PMNS builders + params)    [implemented]
-  solar.py         solar SSM profile + adiabatic MSW                 [implemented]
+  solar.py         solar SSM profile, adiabatic MSW, quadratic solver [implemented]
 ```
 
 Sterile/NSI are wired through the generic-N Hamiltonian: `matter_hamiltonian`

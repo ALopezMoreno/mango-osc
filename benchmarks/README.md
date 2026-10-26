@@ -34,6 +34,7 @@ Drop `JAX_PLATFORMS=cpu` to let JAX pick up a visible GPU/TPU.
 | `bench_derivative_classes.py` | reverse-mode gradient cost for each derivative class through the layered PREM Earth -- oscillation parameters (6), geometry (42) and the full parameter set of a 123-shell LayeredEarth (369) -- with mean and standard deviation over independent groups, and a finite-difference check of every class | Table "Cost of a reverse-mode gradient relative to one forward evaluation" |
 | `bench_ode_backend.py` | Characterizes the continuous (ODE) backend, which the paper does not use: layers needed for the piecewise-constant path to match the adaptive solver on a genuinely smooth profile (~200 for 3e-5, second-order), PREM agreement between the two (2e-4, but only with matched `Y_e` — see the trap noted in `jaxnu/ode.py`), and the Runge-Kutta unitarity drift (6e-8 vs 4e-15 layered) | none — library characterization only |
 | `bench_bsm_derivatives.py` | derivatives with respect to the BSM parameters themselves — dP/dgamma (Lindblad decoherence, Earth diameter) and dP/dalpha (non-unitary mixing, PREM), both at the standard-model point where a limit-setting analysis linearizes | the BSM-derivative figure |
+| `check_solar_quadratic.py` | solar `method="quadratic"` against thin layers at random 3-flavor (with and without large NSI) and 3+1 points over 0.1-20 MeV | none — library validation |
 | `bench_bsm_comparison.py` | the adiabatic solar sector against an independently written closed-form two-flavour MSW formula (the one beyond-standard-model sector for which a non-circular check is possible without a third-party code) | the solar cross-check quoted in the beyond-standard-model section |
 | `bench_timing_and_gradients.py` | (a) the same backend timing rows as above but self-contained in one script including the NuFast port, and (b) `∂P/∂ln ρ` oscillograms for the core and mantle density — the matter-density tomography derivative that no analytic constant-density code (NuFast, Prob3++, ...) can supply | Table "Backend performance per energy point" (self-contained cross-check) and the density-derivative figure discussed in the Introduction/BSM sections |
 
@@ -58,6 +59,7 @@ compilation, which dominates for the smaller scripts:
 | script (mode) | wall time | ran clean? |
 |---|---|---|
 | `check_bsm_limits.py` | ~35-70 s (almost all JIT warm-up) | yes |
+| `check_solar_quadratic.py` | ~3 min on one core | yes |
 | `bench_backends_and_precision.py timing` | ~2-3 min (most of it is `jit`-compiling the 6-parameter PREM gradient once) | yes |
 | `bench_backends_and_precision.py grad` | ~1-2 min | yes |
 | `bench_backends_and_precision.py prec` | ~15-20 s | yes |

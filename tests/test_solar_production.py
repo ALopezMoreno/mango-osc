@@ -15,6 +15,8 @@ from mango import constants as C
 PROFILE = solar.load_bs05(os.path.join(os.path.dirname(__file__), "..", "examples", "data", "bs05_agsop.dat"))
 R = np.asarray(PROFILE.r_over_rsun)
 WEIGHTS = np.exp(-0.5 * ((R - 0.045) / 0.015) ** 2)   # an 8B-like production region
+SF3 = os.path.join(os.path.dirname(__file__), "..", "examples", "data", "struct+nu_SF3_GS98.dat")
+SF3_PROFILE, SF3_WEIGHTS = solar.load_sf3(SF3), solar.load_sf3_production(SF3)
 ENERGY = np.linspace(3e-3, 15e-3, 9)                    # GeV
 
 
@@ -322,6 +324,115 @@ def test_profile_gradient():
                                                    WEIGHTS, method="convolution")[1])(1.0)
 
 
+# --- method="quadratic": no adiabatic assumption ------------------------------------------------------
+
+@pytest.mark.parametrize("theta14", [0.15, 0.03, 0.02, 0.001])
+def test_quadratic_against_layers(theta14):
+    """Adiabatic, Landau-Zener, mixed and sudden sterile crossings: exact propagation through thin layers."""
+    profile, density = _smooth_profile()
+    p, w = _sterile4(theta14, 1e-4), _at(profile, 0.05)
+    got = np.asarray(solar.production_mixing(p, 0.01, profile, w, method="quadratic"))
+    ref = _exact_fractions(p, 0.01, density, 0.05, n_layers=200000, neutrons=0.4)
+    assert np.max(np.abs(got - ref)) < 1e-5 and abs(got.sum() - 1.0) < 1e-10
+
+
+def test_quadratic_production_region():
+    """Weights on five radii through a mixed crossing: the weighted mean of exact per-radius results."""
+    profile, density = _smooth_profile()
+    r, p = np.asarray(profile.r_over_rsun), _sterile4(0.02, 1e-4)
+    idx, wts = [int(np.argmin(np.abs(r - x))) for x in (0.03, 0.05, 0.07, 0.09, 0.11)], np.array([1, 3, 4, 2, 1.0])
+    w = np.zeros(len(r))
+    w[idx] = wts
+    got = np.asarray(solar.production_mixing(p, 0.01, profile, w, method="quadratic"))
+    ref = sum(wi * _exact_fractions(p, 0.01, density, r[i], n_layers=200000, neutrons=0.4) for i, wi in zip(idx, wts))
+    assert np.max(np.abs(got - ref / wts.sum())) < 1e-5
+
+
+@pytest.mark.parametrize("ordering", ["NO", "IO"])
+@pytest.mark.parametrize("anti", [False, True])
+def test_quadratic_matches_adiabatic(ordering, anti):
+    """Three flavors are adiabatic over the SF-III 8B region: quadratic and method='sum' agree."""
+    p = nufit_no() if ordering == "NO" else _inverted(nufit_no())
+    e = np.linspace(2e-3, 15e-3, 8)
+    for nsi in (None, NSI(eps_ee=0.3, eps_emu=0.1, eps_mutau=0.05j, eps_tautau=0.2)):
+        got = np.asarray(solar.production_mixing(p, e, SF3_PROFILE, SF3_WEIGHTS, anti=anti, nsi=nsi,
+                                                 method="quadratic"))
+        ref = np.asarray(solar.production_mixing(p, e, SF3_PROFILE, SF3_WEIGHTS, anti=anti, nsi=nsi))
+        assert np.max(np.abs(got - ref)) < 1e-5
+
+
+def test_quadratic_decoupled_sterile():
+    p3 = nufit_no()
+    e = np.linspace(2e-3, 15e-3, 8)
+    c3 = np.asarray(solar.production_mixing(p3, e, SF3_PROFILE, SF3_WEIGHTS, method="quadratic"))
+    c4 = np.asarray(solar.production_mixing(_decoupled(p3, 1e-4), e, SF3_PROFILE, SF3_WEIGHTS, method="quadratic"))
+    assert np.max(np.abs(c4[:, :3] - c3)) < 1e-5 and np.max(c4[:, 3]) < 1e-12
+
+
+def test_quadratic_gradient_and_jit():
+    """Differentiable in the parameters and the energy, and jit-compatible."""
+    profile, _ = _smooth_profile()
+    w = _at(profile, 0.05)
+
+    def c_s(dm41, energy):
+        return solar.production_mixing(_sterile4(0.03, dm41), energy, profile, w, method="quadratic")[3]
+
+    g = jax.grad(c_s, argnums=(0, 1))(1e-4, 0.01)
+    h = 1e-7                                                        # c oscillates fast in dm41 / E
+    fd = ((c_s(1e-4 * (1 + h), 0.01) - c_s(1e-4 * (1 - h), 0.01)) / (2e-4 * h),
+          (c_s(1e-4, 0.01 * (1 + h)) - c_s(1e-4, 0.01 * (1 - h))) / (2e-2 * h))
+    for gi, fi in zip(g, fd):
+        assert float(gi) == pytest.approx(float(fi), rel=1e-4)
+    e = jnp.linspace(5e-3, 12e-3, 4)
+    jitted = jax.jit(lambda x: solar.production_mixing(_sterile4(0.03, 1e-4), x, profile, w, method="quadratic"))
+    eager = solar.production_mixing(_sterile4(0.03, 1e-4), e, profile, w, method="quadratic")
+    assert np.max(np.abs(np.asarray(jitted(e)) - np.asarray(eager))) < 1e-12
+    with pytest.raises(ValueError, match="concrete"):
+        jax.grad(lambda s: solar.production_mixing(_sterile4(0.03, 1e-4), 0.01, profile, s * jnp.asarray(w),
+                                                   method="quadratic")[0])(1.0)
+
+
+def test_quadratic_against_layers_sf3():
+    """Quadratic against thin layers through the SF-III profile: an outer-zone sterile resonance, and three
+    flavors from a single radius."""
+    from mango.layers import propagate_layers
+    r, ye, yn = (np.asarray(x) for x in (SF3_PROFILE.r_over_rsun, SF3_PROFILE.rho_ye, SF3_PROFILE.rho_yn))
+    for params, energy, r0 in ((_sterile4(0.1, 1.5e-7), 0.01, 0.05), (nufit_no(), 0.006, 0.02)):
+        w = _at(SF3_PROFILE, r0)
+        edges = np.linspace(r[np.argmax(w)], r[-1], 300001)
+        x = 0.5 * (edges[1:] + edges[:-1])
+        s = propagate_layers(params.pmns(), params.msquared(), energy * C.GEV_TO_EV,
+                             C.matter_potential_eV(jnp.asarray(np.interp(x, r, ye)), 1.0),
+                             jnp.asarray(np.diff(edges) * SF3_PROFILE.R_sun_km * C.KM_TO_INV_EV),
+                             v_nc=0.5 * C.matter_potential_eV(jnp.asarray(np.interp(x, r, yn)), 1.0),
+                             n_active=3, backend="eigh")
+        ref = np.abs(np.conj(np.asarray(params.pmns())).T @ np.asarray(s)[:, 0]) ** 2
+        got = np.asarray(solar.production_mixing(params, energy, SF3_PROFILE, w, method="quadratic"))
+        assert np.max(np.abs(got - ref)) < 1e-5
+
+
+def test_quadratic_grid_independent_of_nsi():
+    """NSI do not move the steps: the same result traced or concrete."""
+    p = nufit_no()
+
+    def c_e(x):
+        return solar.production_mixing(p, 0.008, SF3_PROFILE, SF3_WEIGHTS, nsi=NSI(eps_ee=x, eps_etau=0.5 * x),
+                                       method="quadratic")[0]
+    assert abs(float(c_e(2.0)) - float(jax.jit(c_e)(2.0))) < 1e-12
+
+
+def test_quadratic_grid_keeps_production_radii():
+    """A production radius within 1e-10 of a step edge stays an edge of its own."""
+    pot, lo, hi = solar._profile_potentials(SF3_PROFILE)
+    r = np.asarray(SF3_PROFILE.r_over_rsun)
+    r_prod = r[(r > 0.02) & (r < 0.1)]
+    edges = solar._quadratic_grid(pot, lo, hi, r_prod, 3, 3, SF3_PROFILE.R_sun_km * C.KM_TO_INV_EV)
+    step = edges[(edges > 0.3) & ~np.isin(edges, r_prod)][0]
+    r_prod = np.append(r_prod, step + 1e-10)
+    edges = solar._quadratic_grid(pot, lo, hi, r_prod, 3, 3, SF3_PROFILE.R_sun_km * C.KM_TO_INV_EV)
+    assert np.all(np.isin(r_prod, edges)) and np.min(np.diff(edges)) > 0
+
+
 def test_probability_solar_options():
     p = nufit_no()
     with pytest.raises(TypeError, match="cos_zenith"):
@@ -330,8 +441,6 @@ def test_probability_solar_options():
     c = np.asarray(solar.production_mixing(p, ENERGY, PROFILE, WEIGHTS, alpha=1))
     assert np.max(np.abs(mu - c @ np.abs(np.asarray(p.pmns())).T ** 2)) < 1e-12
 
-
-SF3 = os.path.join(os.path.dirname(__file__), "..", "examples", "data", "struct+nu_SF3_GS98.dat")
 
 
 def test_sf3_profile():
