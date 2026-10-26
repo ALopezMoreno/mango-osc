@@ -214,8 +214,9 @@ def adiabatic_mass_fractions(params, energy_GeV, profile, r_km,
 
 _WEIGHT_FLOOR = 1e-14   # production weight, relative to the peak, below which radii are dropped
 _DU = 5e-4              # ln(A) grid spacing of the convolution; interpolation error ~ _DU^2
-GAMMA_WARN = 10.0       # production_mixing warns below this adiabaticity
-_GAMMA_ENERGIES = 8     # energies at which production_mixing checks adiabaticity
+ADIABATIC_GAMMA = 1e3   # is_adiabatic: smallest accepted adiabaticity
+_CHECK_OVERLAP = 0.9    # is_adiabatic: smallest accepted eigenvector overlap between nodes
+_CHECK_NODES = 20       # is_adiabatic: radii checked
 _QUADRATIC_EPS = 0.01   # method="quadratic": step size from ||dH/dr|| h^2 ~ eps
 _QUADRATIC_MIN_STEPS = 64
 _QUADRATIC_GRID_SAMPLES = 4001
@@ -258,39 +259,82 @@ def _hamiltonians(params, energy_eV, v_cc, v_nc, anti, nsi):
                                                      n_active=na))(v_cc, v_nc)
 
 
+def _potential_slopes(profile, x):
+    """``dV_CC/dx`` and ``dV_NC/dx`` (eV^2) at ``x`` [R_sun], continuous between the rows' midpoints."""
+    r = jnp.asarray(profile.r_over_rsun)
+    mid, scale = 0.5 * (r[1:] + r[:-1]), profile.R_sun_km * C.KM_TO_INV_EV
+    v_cc, v_nc = _potentials_eV(profile, r)
+    return tuple(jnp.interp(jnp.asarray(x), mid, jnp.diff(v) / jnp.diff(r)) / scale for v in (v_cc, v_nc))
+
+
+def _same_block(label):
+    """Pairs of matter eigenstates, in (block, eigenvalue) order, of one block."""
+    lab = jnp.sort(label)
+    return (lab[:, None] == lab[None, :]) & ~jnp.eye(lab.shape[0], dtype=bool)
+
+
+def _production_coupling(lam, vec, dh, alpha, same):
+    """Amplitudes ``a = <k|nu_alpha>`` and the first-order production correction ``K a``, with
+    ``K_jk = -i <j|dH/dx|k> / (lambda_j - lambda_k)^2``; the populations are ``|a|^2 - 2 Re(a^* K a)``."""
+    hd = _dag(vec) @ dh @ vec
+    gap = jnp.where(same, lam[..., :, None] - lam[..., None, :], 1.0)
+    a = jnp.conj(vec[..., alpha, :])
+    return a, jnp.einsum("...jk,...k->...j", jnp.where(same, -1j * hd / gap ** 2, 0.0), a)
+
+
 def adiabaticity(params, energy_GeV, profile, r_min=0.0, anti=False, nsi=None):
     """Smallest adiabaticity parameter on the way out of the Sun from ``r_min`` [R_sun], shape ``([n_E])``.
 
-    ``gamma_ij = (lambda_i - lambda_j)^2 / (2 |<i|dH/dx|j>|)``, minimised over radii
-    and pairs of matter eigenstates; at a two-flavor resonance this is the usual
-    ``Delta m^2 sin^2(2 theta) / (2 E cos(2 theta) |d ln n_e / dx|)``. The adiabatic
-    approximation is good to ~1e-5 above gamma ~ 10 and fails at gamma ~ 1-3.
+    ``gamma_ij = (lambda_i - lambda_j)^2 / (2 |<i|dH/dx|j>|)``, minimised over the
+    profile rows and pairs of matter eigenstates; at a two-flavor resonance this is the
+    usual ``Delta m^2 sin^2(2 theta) / (2 E cos(2 theta) |d ln n_e / dx|)``. See
+    :func:`is_adiabatic` for when the adiabatic fractions can be used.
     """
     r = np.asarray(profile.r_over_rsun, dtype=float)
-    sel = np.flatnonzero(r >= r_min)
-    x = jnp.asarray(r[sel] * profile.R_sun_km * C.KM_TO_INV_EV)
-    v_cc, v_nc = _potentials_eV(profile, jnp.asarray(r[sel]))
+    return _scan(params, energy_GeV, profile, r[r >= r_min], anti, nsi)[0]
+
+
+def is_adiabatic(params, energy_GeV, profile, weights, anti=False, nsi=None):
+    """Whether the adiabatic methods of :func:`production_mixing` are within ~1e-4 of the exact fractions, per
+    energy, shape ``([n_E])``.
+
+    True when, on ``_CHECK_NODES`` radii from the innermost production radius to the
+    surface, the smallest :func:`adiabaticity` is at least ``ADIABATIC_GAMMA`` (an
+    empirical threshold) and each matter eigenstate overlaps its neighbour by at least
+    ``_CHECK_OVERLAP``, which catches crossings narrower than the node spacing.
+    """
+    w, keep = _kept_rows(weights)
+    r = np.asarray(profile.r_over_rsun, dtype=float)
+    gamma, overlap = _scan(params, energy_GeV, profile, np.linspace(r[keep].min(), r[-1], _CHECK_NODES), anti, nsi)
+    return (gamma >= ADIABATIC_GAMMA) & (overlap >= _CHECK_OVERLAP)
+
+
+def _scan(params, energy_GeV, profile, x, anti, nsi):
+    """Smallest adiabaticity and smallest neighbour overlap of the matter eigenstates on the radii ``x``."""
     energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
-    return _gamma_min(params, jnp.atleast_1d(energy_eV), x, v_cc, v_nc, _nsi_matrix(nsi, _n_active(params)),
-                      anti, profile.rho_yn is not None).reshape(energy_eV.shape)
+    v_cc, v_nc = _potentials_eV(profile, jnp.asarray(x))
+    out = _scan_nodes(params, jnp.atleast_1d(energy_eV), v_cc, v_nc, *_potential_slopes(profile, x),
+                      _nsi_matrix(nsi, _n_active(params)), anti, profile.rho_yn is not None)
+    return tuple(o.reshape(energy_eV.shape) for o in out)
 
 
 @functools.partial(jax.jit, static_argnames=("anti", "neutrons"))
-def _gamma_min(params, energy_eV, x, v_cc, v_nc, nsi, anti, neutrons):
-    """Minimum over radii and pairs of matter eigenstates of the adiabaticity parameter, per energy."""
+def _scan_nodes(params, energy_eV, v_cc, v_nc, dv_cc, dv_nc, nsi, anti, neutrons):
     u, msq = params.pmns(), params.msquared()
-    iu = np.triu_indices(msq.shape[0], 1)
-    label, _ = _blocks(u, msq, _n_active(params), nsi, neutrons)
+    na = _n_active(params)
+    label, _ = _blocks(u, msq, na, nsi, neutrons)
+    same = _same_block(label)
+    _, m_cc, m_nc = _matter_terms(u, msq, anti, nsi, na)
+    dh = dv_cc[:, None, None] * m_cc + dv_nc[:, None, None] * m_nc
     v_max = jnp.max(jnp.abs(jnp.concatenate([v_cc, v_nc])))
 
     def at_energy(e_eV):
-        h = _hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi)
-        h = h + _block_shift(u, msq, label, e_eV, v_max, nsi, anti)
-        lam, vec = jnp.linalg.eigh(0.5 * (h[1:] + h[:-1]))
-        dh = (h[1:] - h[:-1]) / jnp.diff(x)[:, None, None]
-        coupling = jnp.abs(jnp.einsum("rai,rab,rbj->rij", jnp.conj(vec), dh, vec))[:, iu[0], iu[1]]
-        gap2 = ((lam[:, :, None] - lam[:, None, :]) ** 2)[:, iu[0], iu[1]]
-        return jnp.min(jnp.where(coupling > 0, gap2 / (2.0 * jnp.where(coupling > 0, coupling, 1.0)), jnp.inf))
+        h = _hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi) + _block_shift(u, msq, label, e_eV, v_max, nsi, anti)
+        lam, vec = jnp.linalg.eigh(h)
+        coupling = jnp.where(same, jnp.abs(_dag(vec) @ dh @ vec), 0.0)
+        gap2 = (lam[:, :, None] - lam[:, None, :]) ** 2
+        gamma = jnp.min(jnp.where(coupling > 0, gap2 / (2.0 * jnp.where(coupling > 0, coupling, 1.0)), jnp.inf))
+        return gamma, jnp.min(jnp.abs(jnp.sum(jnp.conj(vec[:-1]) * vec[1:], axis=1)))
 
     return jax.vmap(at_energy)(energy_eV)
 
@@ -308,10 +352,10 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
     The adiabatic methods (``"sum"``, ``"convolution"``) assume that neutrinos follow
     their matter eigenstates: within each block of the Hamiltonian, the k-th lowest
     leaves as the k-th lightest mass state (a sterile with all ``theta_i4 = 0`` is its
-    own block). This fails at narrow avoided crossings, e.g. small active-sterile
-    mixing at Delta m^2_41 ~ 1e-5-1e-4 eV^2; on concrete inputs they warn when
-    :func:`adiabaticity` drops below ``GAMMA_WARN``, unless
-    ``check_adiabaticity=False``.
+    own block), with a first-order correction at the production radius. This fails at
+    narrow avoided crossings, e.g. small active-sterile mixing at Delta m^2_41 ~
+    1e-5-1e-4 eV^2; on concrete inputs they warn where :func:`is_adiabatic` is False,
+    unless ``check_adiabaticity=False``.
 
     ``method="sum"`` diagonalises at every radius and is differentiable in ``params``,
     the profile and the weights. ``method="convolution"`` needs a matter term equal to
@@ -343,8 +387,10 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
                              "to differentiate with respect to them")
         (w, keep), rho_ye = _kept_rows(weights), np.asarray(profile.rho_ye, dtype=float)
         keep = keep & (rho_ye > 0)
-        c = _convolution_mixing(u, msq, energy_GeV, rho_ye[keep], w[keep] / w[keep].sum(), alpha, anti, nsi_mat, na,
-                                label)
+        log_slope = np.asarray(_potential_slopes(profile, np.asarray(profile.r_over_rsun)[keep])[0]) \
+            / np.asarray(C.matter_potential_eV(rho_ye[keep], 1.0))
+        c = _convolution_mixing(u, msq, energy_GeV, rho_ye[keep], w[keep] / w[keep].sum(), log_slope, alpha, anti,
+                                nsi_mat, na, label)
     elif method == "sum":
         r = jnp.asarray(profile.r_over_rsun)
         if _is_concrete(weights):
@@ -355,13 +401,18 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
             w = jnp.asarray(weights)
             w = jnp.where(w > _WEIGHT_FLOOR * jnp.max(w), w, 0.0)
         v_cc, v_nc = _potentials_eV(profile, r)
+        dv_cc, dv_nc = _potential_slopes(profile, r)
         w = w / jnp.sum(w)
         v_max = jnp.max(jnp.abs(jnp.concatenate([v_cc, v_nc])))
+        _, m_cc, m_nc = _matter_terms(u, msq, anti, nsi_mat, na)
+        dh = dv_cc[:, None, None] * m_cc + dv_nc[:, None, None] * m_nc
+        same = _same_block(label)
 
         def at_energy(e_eV):
             shift = _block_shift(u, msq, label, e_eV, v_max, nsi_mat, anti)
-            vecs = jnp.linalg.eigh(_hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi_mat) + shift)[1]
-            return w @ (jnp.abs(vecs[:, alpha, :]) ** 2)
+            lam, vecs = jnp.linalg.eigh(_hamiltonians(params, e_eV, v_cc, v_nc, anti, nsi_mat) + shift)
+            a, ga = _production_coupling(lam, vecs, dh, alpha, same)
+            return w @ (jnp.abs(a) ** 2 - 2.0 * jnp.real(jnp.conj(a) * ga))
 
         energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
         c = at_energy(energy_eV) if energy_eV.ndim == 0 else jax.vmap(at_energy)(energy_eV)
@@ -374,19 +425,15 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
 
 
 def _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi):
-    """Warn when the adiabaticity drops below ``GAMMA_WARN`` (concrete inputs only)."""
-    leaves = jax.tree_util.tree_leaves((params, energy_GeV, profile, weights, nsi))
-    if not all(_is_concrete(x) for x in leaves):
+    """Warn where :func:`is_adiabatic` is False (concrete inputs only)."""
+    if not _all_concrete(params, energy_GeV, profile, weights, nsi):
         return
-    w = np.asarray(weights, dtype=float)
-    r_min = float(np.asarray(profile.r_over_rsun)[np.argmax(w > _WEIGHT_FLOOR * w.max())])
-    e = np.unique(np.asarray(energy_GeV, dtype=float).ravel())
-    e = e[np.unique(np.linspace(0, len(e) - 1, min(len(e), _GAMMA_ENERGIES)).round().astype(int))]
-    gamma = np.asarray(adiabaticity(params, e, profile, r_min=r_min, anti=anti, nsi=nsi))
-    if np.min(gamma) < GAMMA_WARN:
-        warnings.warn(f"production_mixing: adiabaticity parameter down to {np.min(gamma):.3g} at "
-                      f"{1e3 * e[np.argmin(gamma)]:.3g} MeV (below {GAMMA_WARN:g}); Landau-Zener jumps make the "
-                      "adiabatic result unreliable; use method='quadratic'", stacklevel=3)
+    e = np.asarray(energy_GeV, dtype=float).ravel()
+    bad = ~np.asarray(is_adiabatic(params, e, profile, weights, anti=anti, nsi=nsi))
+    if bad.any():
+        warnings.warn(f"production_mixing: adiabatic fractions not within ~1e-4 at {bad.sum()} of {len(e)} energies "
+                      f"({1e3 * e[bad].min():.3g}-{1e3 * e[bad].max():.3g} MeV); use method='quadratic'",
+                      stacklevel=3)
 
 
 def _profile_potentials(profile):
@@ -569,8 +616,9 @@ def probability_solar(params, energy_GeV, profile, weights, cos_zenith=None, alp
     return p if flavor_out is None else p[..., flavor_out]
 
 
-def _convolution_mixing(u, msq, energy_GeV, rho_ye, w, alpha, anti, nsi, n_active, label):
-    """``production_mixing`` by matter eigenstate, as a correlation in ln A."""
+def _convolution_mixing(u, msq, energy_GeV, rho_ye, w, log_slope, alpha, anti, nsi, n_active, label):
+    """``production_mixing`` by matter eigenstate, as a correlation in ln A. The production correction is
+    ``2 E s`` times a second table, ``s = d ln V/dx``, correlated with the weights times ``s``."""
     energy = np.asarray(energy_GeV, dtype=float)
     if not np.all(np.isfinite(energy)):
         raise ValueError("method='convolution' needs concrete, finite energies")
@@ -581,9 +629,10 @@ def _convolution_mixing(u, msq, energy_GeV, rho_ye, w, alpha, anti, nsi, n_activ
     m = int(np.ceil((v.max() - v_min) / _DU)) + 2
     pos = (v - v_min) / _DU
     lo = np.floor(pos).astype(int)
-    kernel = np.zeros(m)
-    np.add.at(kernel, lo, w * (1.0 - (pos - lo)))
-    np.add.at(kernel, lo + 1, w * (pos - lo))
+    kernel = np.zeros((2, m))
+    for i, wi in enumerate((w, w * log_slope)):
+        np.add.at(kernel[i], lo, wi * (1.0 - (pos - lo)))
+        np.add.at(kernel[i], lo + 1, wi * (pos - lo))
     u_e = np.log(k * energy.ravel())
     u_lo = np.floor((u_e.min() - 0.01) / _DU) * _DU
     n_out = int(np.ceil((u_e.max() + 0.01 - u_lo) / _DU)) + 1
@@ -591,10 +640,17 @@ def _convolution_mixing(u, msq, energy_GeV, rho_ye, w, alpha, anti, nsi, n_activ
     A = jnp.asarray(np.exp(u_lo + v_min + _DU * np.arange(n_pad)))
     # Eigenvectors of H and of 2 E H = U diag(msq) U^dag + A (matter matrix) coincide: E = 1/2 eV, V = A.
     shift = _block_shift(u, msq, label, 0.5, A[-1], nsi, anti)
-    h = jax.vmap(lambda a: jnp.abs(_matter_eigvecs(u, msq, 0.5, a, 0.0, anti, nsi, n_active, shift)[alpha]) ** 2)(A)
+    m_vac, m_cc, _ = _matter_terms(u, msq, anti, nsi, n_active)
+    lam, vec = jnp.linalg.eigh(m_vac + A[:, None, None] * m_cc + shift)
+    a, ga = _production_coupling(lam, vec, A[:, None, None] * m_cc, alpha, _same_block(label))
+    tables = jnp.stack([jnp.abs(a) ** 2, -2.0 * jnp.real(jnp.conj(a) * ga)])                     # (2, n_A, N)
     n_fft = int(2 ** np.ceil(np.log2(n_pad + m - 1)))
-    kernel_fft = jnp.asarray(np.fft.rfft(kernel[::-1], n_fft))
-    corr = jnp.fft.irfft(jnp.fft.rfft(h.T, n_fft) * kernel_fft, n_fft)[:, m - 1:n_pad]
+    kernel_fft = jnp.asarray(np.fft.rfft(kernel[:, ::-1], n_fft))
+    corr = jnp.fft.irfft(jnp.fft.rfft(jnp.swapaxes(tables, 1, 2), n_fft) * kernel_fft[:, None, :], n_fft)
+    corr = corr[..., m - 1:n_pad]                                                                   # (2, N, n_out)
     grid = jnp.asarray(u_lo + _DU * np.arange(n_out))
-    out = jax.vmap(jnp.interp, in_axes=(None, None, 0))(jnp.asarray(u_e), grid, corr).T
-    return out.reshape(energy.shape + (corr.shape[0],))
+    t = 2.0 * C.GEV_TO_EV * jnp.asarray(energy.ravel())                                             # 2 E (eV)
+    interp = jax.vmap(jax.vmap(jnp.interp, in_axes=(None, None, 0)), in_axes=(None, None, 0))
+    terms = interp(jnp.asarray(u_e), grid, corr)
+    out = (terms[0] + t * terms[1]).T
+    return out.reshape(energy.shape + (corr.shape[1],))

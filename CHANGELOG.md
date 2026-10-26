@@ -36,7 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`method="exact"`**: 200k constant-density layers, the reference for the
   other methods.
 - **`solar.adiabaticity`**: the smallest adiabaticity parameter on the way out
-  of the Sun; `production_mixing` warns below 10 unless `check_adiabaticity=False`.
+  of the Sun.
+- **`solar.is_adiabatic`**: per energy, whether the adiabatic fractions are within
+  ~1e-4; `production_mixing` warns where they are not.
+- **First-order production correction** in the adiabatic methods, removing the
+  leading `1/gamma` error.
 - **B23/SF-III solar models**: `solar.load_sf3` and `load_sf3_production`, with
   the GS98 table in `examples/data/`. Densities count all electrons, not the
   tables' free-electron `log_ne`.

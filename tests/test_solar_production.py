@@ -33,7 +33,8 @@ def _sterile(theta14=0.15):
 
 
 def _brute(params, alpha=0, anti=False, neutrons=False):
-    """Production-averaged mass-state fractions with numpy eigh, radius by radius.
+    """Production-averaged mass-state fractions with numpy eigh, radius by radius, each neutrino starting in the
+    first-order superadiabatic state (1 - K) a, K_jk = -i <j|dH/dx|k> / (lambda_j - lambda_k)^2, to first order.
 
     Each matter eigenstate is assigned to the mass state its vacuum limit overlaps most, so no
     ordering rule is assumed.
@@ -48,15 +49,25 @@ def _brute(params, alpha=0, anti=False, neutrons=False):
     sign = -1.0 if anti else 1.0
     v_cc = sign * C.V_FACTOR_EV * np.asarray(PROFILE.rho_ye)[keep]
     v_nc = sign * 0.5 * C.V_FACTOR_EV * np.asarray(PROFILE.rho_yn)[keep] if neutrons else 0 * v_cc
+    r = np.asarray(PROFILE.r_over_rsun)
+    slope = [np.interp(r[keep], 0.5 * (r[1:] + r[:-1]), np.diff(sign * f * C.V_FACTOR_EV * np.asarray(y)) / np.diff(r))
+             / (PROFILE.R_sun_km * C.KM_TO_INV_EV) for f, y in ((1.0, PROFILE.rho_ye), (0.5, PROFILE.rho_yn))]
+    if not neutrons:
+        slope[1] = 0 * slope[1]
     m_cc = np.zeros((n, n)); m_cc[0, 0] = 1.0
     m_nc = np.diag((np.arange(n) >= na).astype(float))
     out = []
     for e in ENERGY:
         h0 = (u * msq / (2 * e * C.GEV_TO_EV)) @ np.conj(u).T
-        vec = np.linalg.eigh(h0[None] + v_cc[:, None, None] * m_cc + v_nc[:, None, None] * m_nc)[1]
+        lam, vec = np.linalg.eigh(h0[None] + v_cc[:, None, None] * m_cc + v_nc[:, None, None] * m_nc)
+        hd = np.conj(np.swapaxes(vec, 1, 2)) @ (slope[0][:, None, None] * m_cc + slope[1][:, None, None] * m_nc) @ vec
+        gap = lam[:, :, None] - lam[:, None, :]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            k = np.where((np.abs(hd) > 0) & ~np.eye(n, dtype=bool), -1j * hd / gap ** 2, 0.0)
+        a = np.conj(vec[:, alpha, :])
         perm = np.argmax(np.abs(np.conj(u).T @ np.linalg.eigh(h0)[1]) ** 2, axis=0)
         c = np.zeros(n)
-        c[perm] = w @ (np.abs(vec[:, alpha, :]) ** 2)
+        c[perm] = w @ (np.abs(a) ** 2 - 2 * np.real(np.conj(a) * np.einsum("rjk,rk->rj", k, a)))
         out.append(c)
     return np.array(out)
 
@@ -96,7 +107,7 @@ def test_antineutrinos():
 
 def test_steriles_feel_neutrons():
     st = _sterile()
-    got = np.asarray(solar.production_mixing(st, ENERGY, PROFILE, WEIGHTS))
+    got = np.asarray(solar.production_mixing(st, ENERGY, PROFILE, WEIGHTS, check_adiabaticity=False))
     assert np.max(np.abs(got - _brute(st, neutrons=True))) < 1e-12
     blind = PROFILE._replace(rho_yn=None)
     assert np.max(np.abs(got - np.asarray(solar.production_mixing(st, ENERGY, blind, WEIGHTS)))) > 1e-6
@@ -200,22 +211,35 @@ def test_adiabatic_against_exact_propagation_bs05():
     assert np.max(np.abs(np.asarray(solar.production_mixing(p, 0.01, PROFILE, w)) - exact)) < 1e-4
 
 
-@pytest.mark.parametrize("theta14, energy, tol", [(0.1, 0.01, 1e-4), (0.05, 0.01, 1e-4)])
-def test_adiabatic_steriles_against_exact_propagation(theta14, energy, tol):
-    """Adiabatic sterile resonances (gamma ~ 10-50) on a smooth profile: no warning, exact to ~1e-5."""
-    profile, density = _smooth_profile()
-    p, w = _sterile4(theta14, 1e-4), _at(profile, 0.05)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        got = np.asarray(solar.production_mixing(p, energy, profile, w))
-    assert np.max(np.abs(got - _exact_fractions(p, energy, density, 0.05, neutrons=0.4))) < tol
+def test_is_adiabatic():
+    """Three flavors through SF-III pass and are within 1e-5 of exact propagation; across a 3+1 crossing that
+    turns from adiabatic to Landau-Zener with energy, every accepted energy is within 1e-4 and the rejected ones
+    include the non-adiabatic ones."""
+    e = np.linspace(2e-3, 16e-3, 8)
+    assert np.all(solar.is_adiabatic(nufit_no(), e, SF3_PROFILE, SF3_WEIGHTS))
+    for p in (nufit_no(), _sterile4(0.02, 1e-4)):
+        ok = np.asarray(solar.is_adiabatic(p, e, SF3_PROFILE, SF3_WEIGHTS))
+        got, ref = (np.asarray(solar.production_mixing(p, e, SF3_PROFILE, SF3_WEIGHTS, method=m, check_adiabaticity=False))
+                    for m in ("sum", "exact"))
+        err = np.max(np.abs(got - ref), axis=1)
+        assert np.all(err[ok] < 1e-4) and np.all(ok[err < 1e-5] | (p.msquared().shape[0] == 4))
+    assert not ok.all() and err[~ok].max() > 1e-2
+
+
+def test_production_correction():
+    """The production correction removes the leading adiabatic error over the SF-III 8B region."""
+    for alpha, nsi in ((0, NSI(eps_ee=-1.2, eps_emu=0.3 + 0.4j, eps_etau=-0.2 + 0.3j)),
+                       (1, NSI(eps_ee=-1.5, eps_mutau=0.3j, eps_emu=0.4j))):
+        got, ref = (np.asarray(solar.production_mixing(nufit_no(), 0.012, SF3_PROFILE, SF3_WEIGHTS, alpha=alpha, nsi=nsi,
+                                                       method=m)) for m in ("sum", "exact"))
+        assert np.max(np.abs(got - ref)) < 2e-7
 
 
 def test_nonadiabatic_steriles_warn():
     """theta14 = 0.02 at 1e-4 eV^2, 10 MeV: gamma ~ 1.8, Landau-Zener jumps, and a warning."""
     profile, density = _smooth_profile()
     p, w = _sterile4(0.02, 1e-4), _at(profile, 0.05)
-    with pytest.warns(UserWarning, match="adiabaticity"):
+    with pytest.warns(UserWarning, match="not within"):
         got = np.asarray(solar.production_mixing(p, 0.01, profile, w))
     assert np.max(np.abs(got - _exact_fractions(p, 0.01, density, 0.05, neutrons=0.4))) > 1e-2
 
