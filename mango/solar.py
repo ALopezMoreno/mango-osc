@@ -219,6 +219,7 @@ _GAMMA_ENERGIES = 8     # energies at which production_mixing checks adiabaticit
 _QUADRATIC_EPS = 0.01   # method="quadratic": step size from ||dH/dr|| h^2 ~ eps
 _QUADRATIC_MIN_STEPS = 64
 _QUADRATIC_GRID_SAMPLES = 4001
+_EXACT_LAYERS = 200000  # method="exact": uniform constant-density layers
 
 
 def _check_weights(weights, profile):
@@ -322,12 +323,14 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
     by Magnus steps on a radial grid fixed by the profile (error ~1e-5, ~1e-4 from
     single radii of coarse tables such as BS05; ~10-20 ms per energy). It needs a
     concrete profile and weights and is differentiable in ``params`` and the energies.
+    ``method="exact"`` propagates through ``_EXACT_LAYERS`` constant-density layers:
+    the reference for the other methods, ~0.4 s per energy.
     """
     _check_weights(weights, profile)
     u, msq = params.pmns(), params.msquared()
     n, na = msq.shape[0], _n_active(params)
     nsi_mat = _nsi_matrix(nsi, na)
-    if method == "quadratic":
+    if method in ("quadratic", "exact"):
         return _path_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi_mat, na, method)
     label, mass_order = _blocks(u, msq, na, nsi_mat, profile.rho_yn is not None)
 
@@ -363,7 +366,7 @@ def production_mixing(params, energy_GeV, profile, weights, alpha=0, anti=False,
         energy_eV = jnp.asarray(energy_GeV) * C.GEV_TO_EV
         c = at_energy(energy_eV) if energy_eV.ndim == 0 else jax.vmap(at_energy)(energy_eV)
     else:
-        raise ValueError(f"unknown method {method!r}; choose 'sum', 'convolution' or 'quadratic'")
+        raise ValueError(f"unknown method {method!r}; choose 'sum', 'convolution', 'quadratic' or 'exact'")
     if check_adiabaticity:
         _warn_if_nonadiabatic(params, energy_GeV, profile, weights, anti, nsi)
     # k-th matter eigenstate in (block, eigenvalue) order -> k-th mass state in (block, m^2) order.
@@ -410,7 +413,7 @@ def _matter_terms(u, msq, anti, nsi, n_active):
     return m_vac, h(1.0, 0.0) - m_vac, h(0.0, 1.0) - m_vac
 
 
-# --- method="quadratic": interaction-picture Magnus steps on a fixed grid ------------------------------
+# method="quadratic" and method="exact": propagation on a fixed radial grid.
 
 
 def _path_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi, n_active, method):
@@ -421,7 +424,10 @@ def _path_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi, n_activ
     w, keep = _kept_rows(weights)
     r_prod = np.asarray(profile.r_over_rsun, dtype=float)[keep]
     pot, lo, hi = _profile_potentials(profile)
-    edges = _quadratic_grid(pot, lo, hi, r_prod, msq.shape[0], n_active, profile.R_sun_km * C.KM_TO_INV_EV)
+    if method == "quadratic":
+        edges = _quadratic_grid(pot, lo, hi, r_prod, msq.shape[0], n_active, profile.R_sun_km * C.KM_TO_INV_EV)
+    else:
+        edges = _with_production_edges(np.linspace(r_prod.min(), hi, _EXACT_LAYERS + 1), r_prod, lo, hi)
     nodes = np.empty(2 * len(edges) - 1)
     nodes[0::2], nodes[1::2] = edges, 0.5 * (edges[1:] + edges[:-1])
     v_cc, _, v_nc, _ = pot(nodes)
@@ -431,7 +437,7 @@ def _path_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi, n_activ
     return _path_fractions(u, msq, jnp.asarray(v_cc), jnp.asarray(v_nc),
                              jnp.asarray(np.diff(edges) * profile.R_sun_km * C.KM_TO_INV_EV),
                              jnp.asarray(w_edge / w_edge.sum()), nsi, jnp.asarray(energy_GeV) * C.GEV_TO_EV,
-                             alpha=alpha, anti=anti, n_active=n_active)
+                             alpha=alpha, anti=anti, n_active=n_active, layers=method == "exact")
 
 
 def _quadratic_grid(pot, lo, hi, r_prod, n, n_active, scale):
@@ -458,27 +464,30 @@ def _with_production_edges(q, r_prod, lo, hi):
     return np.union1d(q[far], fixed)
 
 
-@functools.partial(jax.jit, static_argnames=("alpha", "anti", "n_active"))
-def _path_fractions(u, msq, v_cc, v_nc, length, w_edge, nsi, energy_eV, alpha, anti, n_active):
+@functools.partial(jax.jit, static_argnames=("alpha", "anti", "n_active", "layers"))
+def _path_fractions(u, msq, v_cc, v_nc, length, w_edge, nsi, energy_eV, alpha, anti, n_active, layers=False):
     """Mass-state fractions averaged over the edge weights, shape ``([n_E,] N)``."""
     # One energy at a time, recomputed in the backward pass: reverse-mode memory independent of n_E.
     one = jax.checkpoint(functools.partial(_path_one, u, msq, v_cc, v_nc, length, w_edge, nsi, alpha=alpha,
-                                           anti=anti, n_active=n_active))
+                                           anti=anti, n_active=n_active, layers=layers))
     return one(energy_eV) if energy_eV.ndim == 0 else jax.lax.map(one, energy_eV)
 
 
-def _path_one(u, msq, v_cc, v_nc, length, w_edge, nsi, energy_eV, alpha, anti, n_active):
+def _path_one(u, msq, v_cc, v_nc, length, w_edge, nsi, energy_eV, alpha, anti, n_active, layers):
     m_vac, m_cc, m_nc = _matter_terms(u, msq, anti, nsi, n_active)
     h = m_vac / (2.0 * energy_eV) + v_cc[:, None, None] * m_cc + v_nc[:, None, None] * m_nc
     hl, hm, hr = h[0:-1:2], h[1::2], h[2::2]
     t = length[:, None, None]
-    w, q = _eigh_safe(hm)
-    qh = _dag(q)
-    h1 = qh @ ((hr - hl) / t) @ q                                    # delta(s) = h1 s + h2 s^2 / 2 about the midpoint
-    h2 = qh @ (4.0 * (hr - 2.0 * hm + hl) / t ** 2) @ q
-    m1, m2 = _ip_moments((w[:, :, None] - w[:, None, :]) * t, t)
-    half = _expmh(hm * (0.5 * t))
-    steps = half @ (q @ _expmh(h1 * m1 + 0.5 * h2 * m2) @ qh) @ half
+    if layers:                                                       # constant density at the midpoint
+        steps = _expmh(hm * t)
+    else:
+        w, q = _eigh_safe(hm)
+        qh = _dag(q)
+        h1 = qh @ ((hr - hl) / t) @ q                                # delta(s) = h1 s + h2 s^2 / 2 about the midpoint
+        h2 = qh @ (4.0 * (hr - 2.0 * hm + hl) / t ** 2) @ q
+        m1, m2 = _ip_moments((w[:, :, None] - w[:, None, :]) * t, t)
+        half = _expmh(hm * (0.5 * t))
+        steps = half @ (q @ _expmh(h1 * m1 + 0.5 * h2 * m2) @ qh) @ half
     tails = jax.lax.associative_scan(lambda a, b: a @ b, steps, reverse=True)   # S(surface <- edge k)
     tails = jnp.concatenate([tails, jnp.eye(tails.shape[-1], dtype=tails.dtype)[None]])
     udag = (u if anti else jnp.conj(u)).T

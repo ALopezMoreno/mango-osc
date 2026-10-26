@@ -336,6 +336,16 @@ def test_quadratic_against_layers(theta14):
     assert np.max(np.abs(got - ref)) < 1e-5 and abs(got.sum() - 1.0) < 1e-10
 
 
+def test_exact_layers():
+    """method='exact' (thin layers through the profile) against an independent layer propagation and against
+    method='quadratic', through a mixed crossing."""
+    profile, density = _smooth_profile()
+    p, w = _sterile4(0.02, 1e-4), _at(profile, 0.05)
+    got = np.asarray(solar.production_mixing(p, 0.01, profile, w, method="exact"))
+    assert np.max(np.abs(got - _exact_fractions(p, 0.01, density, 0.05, n_layers=200000, neutrons=0.4))) < 1e-6
+    assert np.max(np.abs(got - np.asarray(solar.production_mixing(p, 0.01, profile, w, method="quadratic")))) < 1e-5
+
+
 def test_quadratic_production_region():
     """Weights on five radii through a mixed crossing: the weighted mean of exact per-radius results."""
     profile, density = _smooth_profile()
