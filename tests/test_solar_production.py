@@ -403,6 +403,24 @@ def test_quadratic_decoupled_sterile():
     assert np.max(np.abs(c4[:, :3] - c3)) < 1e-5 and np.max(c4[:, 3]) < 1e-12
 
 
+def test_quadratic_parallel(monkeypatch):
+    """The GPU/TPU path (vmap over energies) gives the CPU path's values and gradients."""
+    profile, _ = _smooth_profile()
+    w = _at(profile, 0.05)
+    e = jnp.linspace(5e-3, 12e-3, 3)
+
+    def run(dm41):
+        c = solar.production_mixing(_sterile4(0.03, dm41), e, profile, w, method="quadratic")
+        return c, jax.grad(lambda d: solar.production_mixing(_sterile4(0.03, d), e, profile, w,
+                                                             method="quadratic")[:, 3].sum())(dm41)
+
+    cpu = run(1e-4)
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    gpu = run(1e-4)
+    np.testing.assert_allclose(gpu[0], cpu[0], atol=1e-12)
+    assert float(gpu[1]) == pytest.approx(float(cpu[1]), rel=1e-9)
+
+
 def test_quadratic_gradient_and_jit():
     """Differentiable in the parameters and the energy, and jit-compatible."""
     profile, _ = _smooth_profile()

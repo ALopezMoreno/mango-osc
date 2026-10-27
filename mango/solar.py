@@ -486,7 +486,8 @@ def _path_mixing(params, energy_GeV, profile, weights, alpha, anti, nsi, n_activ
     return _path_fractions(u, msq, jnp.asarray(v_cc), jnp.asarray(v_nc),
                              jnp.asarray(np.diff(edges) * profile.R_sun_km * C.KM_TO_INV_EV),
                              jnp.asarray(w_edge / w_edge.sum()), nsi, jnp.asarray(energy_GeV) * C.GEV_TO_EV,
-                             alpha=alpha, anti=anti, n_active=n_active, layers=method == "exact")
+                             alpha=alpha, anti=anti, n_active=n_active, layers=method == "exact",
+                             parallel=jax.default_backend() != "cpu")
 
 
 def _quadratic_grid(pot, lo, hi, r_prod, n, n_active, scale):
@@ -513,13 +514,18 @@ def _with_production_edges(q, r_prod, lo, hi):
     return np.union1d(q[far], fixed)
 
 
-@functools.partial(jax.jit, static_argnames=("alpha", "anti", "n_active", "layers"))
-def _path_fractions(u, msq, v_cc, v_nc, length, w_edge, nsi, energy_eV, alpha, anti, n_active, layers=False):
+@functools.partial(jax.jit, static_argnames=("alpha", "anti", "n_active", "layers", "parallel"))
+def _path_fractions(u, msq, v_cc, v_nc, length, w_edge, nsi, energy_eV, alpha, anti, n_active, layers=False,
+                    parallel=False):
     """Mass-state fractions averaged over the edge weights, shape ``([n_E,] N)``."""
-    # One energy at a time, recomputed in the backward pass: reverse-mode memory independent of n_E.
-    one = jax.checkpoint(functools.partial(_path_one, u, msq, v_cc, v_nc, length, w_edge, nsi, alpha=alpha,
-                                           anti=anti, n_active=n_active, layers=layers))
-    return one(energy_eV) if energy_eV.ndim == 0 else jax.lax.map(one, energy_eV)
+    one = functools.partial(_path_one, u, msq, v_cc, v_nc, length, w_edge, nsi, alpha=alpha, anti=anti,
+                            n_active=n_active, layers=layers)
+    if energy_eV.ndim == 0:
+        return one(energy_eV)
+    if parallel:                                                     # GPU/TPU: all energies at once
+        return jax.vmap(one)(energy_eV)
+    # CPU: one energy at a time, recomputed in the backward pass, so reverse-mode memory does not grow with n_E.
+    return jax.lax.map(jax.checkpoint(one), energy_eV)
 
 
 def _path_one(u, msq, v_cc, v_nc, length, w_edge, nsi, energy_eV, alpha, anti, n_active, layers):
