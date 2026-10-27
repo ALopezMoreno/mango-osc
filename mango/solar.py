@@ -7,6 +7,8 @@ solar solution. Idea adapted from the nu-waves library. :func:`production_mixing
 averages that composition over a source's production region, and
 :func:`probability_solar` turns it into probabilities by day and at night. Where
 level crossings are not adiabatic, ``method="quadratic"`` integrates the evolution.
+See ``adiabaticity_readme.md`` next to this module for the methods and the
+adiabaticity check.
 
 In the adiabatic regime a neutrino produced as flavor ``alpha`` populates the
 instantaneous matter eigenstates with fixed weights ``w_k = |<nu_k^m|nu_alpha>|^2``
